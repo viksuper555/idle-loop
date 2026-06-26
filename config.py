@@ -20,6 +20,10 @@ class Labels:
     ready: str = "idle:ready"
     needs_human: str = "idle:needs-human"
     allow_sensitive: str = "idle:allow-sensitive"
+    # Opt-in budget override: a ticket carrying this label may exceed the default
+    # per-ticket caps up to the configured override ceilings (Budget.override_*),
+    # and is re-dispatched even when parked. The global cap still applies.
+    allow_budget: str = "idle:allow-budget"
     # Applied to a PR the moment idle-loop opens it; idle keeps watching the PR
     # for new reviews while it carries this label, and drops it once the PR is
     # deferred to a human (see Orchestrator.watch_reviews).
@@ -43,6 +47,10 @@ class Budget:
     max_iterations: int = 20  # per ticket
     per_ticket_cap_usd: float = 40.0
     global_cap_usd: float = 200.0
+    # Elevated per-ticket ceilings used only for a ticket carrying the
+    # labels.allow_budget override; the global cap is never raised.
+    override_max_iterations: int = 40
+    override_per_ticket_cap_usd: float = 80.0
     no_progress_limit: int = 3  # identical error / empty diff N times -> bail
     review_iterations: int = 2  # times to send reviewer feedback back to the
     # implementer on the SAME branch before parking for a human

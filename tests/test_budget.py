@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from config import Config
 from guards.base import GuardContext
-from guards.budget import BudgetGuard, detect_no_progress
+from guards.budget import BudgetGuard, detect_no_progress, effective_caps
 from models import ImplementationResult, Ticket
 
 
@@ -61,8 +61,10 @@ def test_no_progress_zero_limit_disabled():
 # --------------------------------------------------------------------------- #
 # BudgetGuard
 # --------------------------------------------------------------------------- #
-def _ctx(impl: ImplementationResult | None, config: Config) -> GuardContext:
-    ticket = Ticket(number=1, title="t", body="b")
+def _ctx(
+    impl: ImplementationResult | None, config: Config, labels: list[str] | None = None
+) -> GuardContext:
+    ticket = Ticket(number=1, title="t", body="b", labels=labels or [])
     return GuardContext(ticket=ticket, config=config, implementation=impl)
 
 
@@ -70,6 +72,8 @@ def _config() -> Config:
     cfg = Config(repo="owner/name")
     cfg.budget.max_iterations = 10
     cfg.budget.per_ticket_cap_usd = 20.0
+    cfg.budget.override_max_iterations = 40
+    cfg.budget.override_per_ticket_cap_usd = 80.0
     return cfg
 
 
@@ -130,3 +134,50 @@ def test_budget_no_progress_precedence_over_caps():
     res = BudgetGuard(cfg).check(_ctx(impl, cfg))
     assert res.passed is False
     assert "no-progress" in res.reason
+
+
+# --------------------------------------------------------------------------- #
+# Budget override (idle:allow-budget) — ticket #28
+# --------------------------------------------------------------------------- #
+def test_effective_caps_default_without_label():
+    cfg = _config()
+    ticket = Ticket(number=1, title="t", body="b")
+    assert effective_caps(cfg, ticket) == (10, 20.0)
+
+
+def test_effective_caps_raised_with_label():
+    cfg = _config()
+    ticket = Ticket(number=1, title="t", body="b", labels=["idle:allow-budget"])
+    assert effective_caps(cfg, ticket) == (40, 80.0)
+
+
+def test_effective_caps_no_ticket_is_default():
+    cfg = _config()
+    assert effective_caps(cfg, None) == (10, 20.0)
+
+
+def test_budget_override_allows_exceeding_default_caps():
+    # iterations 11 (> default 10) and $30 (> default $20) but under the override
+    # ceilings (40 / $80) -> passes with the label, where it would otherwise fail.
+    cfg = _config()
+    impl = ImplementationResult(branch="b", iterations=11, cost_usd=30.0)
+    res = BudgetGuard(cfg).check(_ctx(impl, cfg, labels=["idle:allow-budget"]))
+    assert res.passed is True
+
+
+def test_budget_without_override_label_is_unchanged():
+    # Same overspend, no label -> the default caps still park it.
+    cfg = _config()
+    impl = ImplementationResult(branch="b", iterations=11, cost_usd=30.0)
+    res = BudgetGuard(cfg).check(_ctx(impl, cfg))
+    assert res.passed is False
+
+
+def test_budget_override_still_capped_at_override_ceiling():
+    # The override raises the wall, it does not remove it: past the override
+    # ceiling the guard fails again.
+    cfg = _config()
+    over_iters = ImplementationResult(branch="b", iterations=41, cost_usd=5.0)
+    assert BudgetGuard(cfg).check(_ctx(over_iters, cfg, ["idle:allow-budget"])).passed is False
+    over_cost = ImplementationResult(branch="b", iterations=5, cost_usd=80.01)
+    assert BudgetGuard(cfg).check(_ctx(over_cost, cfg, ["idle:allow-budget"])).passed is False

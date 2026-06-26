@@ -267,6 +267,7 @@ def test_run_ensures_idle_labels_before_processing(tmp_path):
             "idle:allow-sensitive",
             "idle:listen",
             "idle:in-progress",
+            "idle:allow-budget",
         ]
     ]
 
@@ -565,6 +566,7 @@ def test_ensure_labels_syncs_without_running_loop(monkeypatch):
         "idle:allow-sensitive",
         "idle:listen",
         "idle:in-progress",
+        "idle:allow-budget",
     ]
 
 
@@ -1036,6 +1038,32 @@ def test_discover_skips_needs_human_and_in_progress(tmp_path):
     discovered = orch.discover()
 
     assert [t.number for t in discovered] == [1]
+
+
+def test_discover_redispatches_budget_override_parked_ticket(tmp_path):
+    # A ticket parked on a limit (needs-human, idle:ready already dropped) that a
+    # human then labels idle:allow-budget is re-dispatched to continue.
+    plain = ticket(1)  # normal ready ticket
+    parked = ticket(2)
+    parked.labels = ["idle:needs-human", "idle:allow-budget"]  # parked + overridden
+    orch, gh, _, _ = make_orch(tmp_path, issues=[plain, parked])
+
+    discovered = orch.discover()
+
+    assert {t.number for t in discovered} == {1, 2}  # the override waives the skip
+
+
+def test_budget_override_does_not_bypass_global_cap(tmp_path):
+    # The override raises per-ticket caps only — the loop-wide global cap is the
+    # hard backstop and still stops dispatch.
+    a, b = ticket(1), ticket(2)
+    a.labels = ["idle:ready", "idle:allow-budget"]
+    b.labels = ["idle:ready", "idle:allow-budget"]
+    orch, gh, _, _ = make_orch(
+        tmp_path, issues=[a, b], require_human=False, global_cap=5.0
+    )
+    records = orch.run()  # each ticket costs $10 (good_impl); cap is $5
+    assert len(records) == 1  # stopped after the first despite the override
 
 
 def test_open_pr_marks_issue_in_progress(tmp_path):
