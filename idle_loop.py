@@ -567,9 +567,15 @@ def _cost_chip_body(estimate: EstimateResult, spent: float | None) -> str:
         url = _shield_url("idle-loop cost", message, "blue")
         caption = f"**idle-loop cost estimate:** {band}"
     else:
+        # Green while the running cost is within the estimate's upper edge,
+        # orange once it overruns — so a human scanning the board sees an
+        # over-budget run at a glance, without reading the number.
+        over = spent > estimate.estimated_cost + estimate.margin
+        color = "orange" if over else "brightgreen"
+        flag = " ⚠️ over estimate" if over else ""
         message = f"${spent:.2f} spent / est {band}"
-        url = _shield_url("idle-loop cost", message, "brightgreen")
-        caption = f"**idle-loop cost so far:** ${spent:.2f} _(estimate {band})_"
+        url = _shield_url("idle-loop cost", message, color)
+        caption = f"**idle-loop cost so far:** ${spent:.2f} _(estimate {band})_{flag}"
     return f"{COST_CHIP_MARKER}\n![idle-loop cost]({url})\n\n{caption}"
 
 

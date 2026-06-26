@@ -504,6 +504,32 @@ def test_cost_chip_tracks_each_revision(tmp_path):
     assert "$8.00" in gh.sticky[(1, idle_loop.COST_CHIP_MARKER)]
 
 
+def test_cost_chip_flags_overrun_when_spend_exceeds_estimate(tmp_path):
+    # A run that blows past its estimate band must flag the chip (orange +
+    # warning) so a board-watcher sees the overrun without reading the number.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], impl=good_impl(cost=500.0), require_human=False
+    )
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.MERGED
+
+    final = gh.sticky[(1, idle_loop.COST_CHIP_MARKER)]
+    assert "$500.00" in final
+    assert "over estimate" in final
+    assert "orange" in final  # badge color signals the overrun
+
+
+def test_cost_chip_not_flagged_within_estimate(tmp_path):
+    # Spend inside the estimate band stays green with no warning.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], impl=good_impl(cost=0.01), require_human=False
+    )
+    orch.process_ticket(ticket(1))
+    final = gh.sticky[(1, idle_loop.COST_CHIP_MARKER)]
+    assert "over estimate" not in final
+    assert "brightgreen" in final
+
+
 def test_dry_run_posts_no_cost_chip(tmp_path):
     orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
     orch.run(dry_run=True)
