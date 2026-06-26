@@ -10,7 +10,7 @@
 
 `idle-loop` watches a GitHub issue board, picks ready tickets one at a time, and runs each through a full autonomous cycle: estimate cost → implement on an isolated branch → fail-closed guardrails → a **separate review agent** that checks the PR against the ticket's acceptance criteria → merge only if everything passes, otherwise park it for a human with a clear reason.
 
-Its signature, differentiating feature: a **pre-loop cost estimator** that prices each ticket *before any tokens are spent*, so work is triaged by ROI (ship the $30 ticket tonight; flag the $300 ticket for a human first).
+Its signature, differentiating feature: a **pre-loop cost estimator** that prices each ticket up front — from a cheap, grounded planning pass (or a zero-token heuristic) — so work is triaged by ROI (ship the $30 ticket tonight; flag the $300 ticket for a human first).
 
 ## 2. Why (positioning context — build agents may skip)
 
@@ -68,7 +68,7 @@ A distinct prompt/role. Input: the diff + the ticket's acceptance criteria. Outp
 
 > **Provenance:** the pre-loop, per-ticket cost-estimation gate is this project's original contribution. Keep the attribution in the README.
 
-**Purpose:** price a ticket *before* spending tokens, so tickets can be triaged by ROI.
+**Purpose:** price a ticket up front so tickets can be triaged by ROI. Two modes: a zero-token heuristic (v1) and a deterministic planning pass (v3, the default).
 
 **v1 — transparent heuristic.** Score each ticket on cheap, explainable proxies:
 - number of acceptance criteria,
@@ -82,6 +82,8 @@ Combine into `estimated_iterations`, then `estimated_cost = estimated_iterations
 **Output:** `{estimated_cost, estimated_iterations, confidence}` rendered honestly as a band, e.g. `~$30 ± $20`. Never present false precision.
 
 **v2 — learned (stretch).** Every real run logs its pre-estimate features alongside actual cost/iterations (§8). Once enough rows exist, fit a simple regression on those features and swap it in behind the same interface. The estimator improves the more the loop runs.
+
+**v3 — deterministic (planning pass, the default).** Rather than infer cost from iteration counts, run a cheap read-only `claude` planning session (`agents/planner.py`) that inspects the actual code and reports a token budget `{estimated_input_tokens, estimated_output_tokens}`; `estimated_cost = pricing.cost_for_tokens(...)`. The implementer **resumes that session** (seeded via the worktree session file) so the plan carries into implementation. This spends a small, bounded planning pass before triage; a heuristic pre-filter (`triage.prefilter_multiplier`) skips planning for obviously-over-budget tickets, and `--dry-run` plus any planning failure fall back to the v1 heuristic. Disable with `planner.enabled: false`. The issue cost chip carries a sibling tokens badge (spent vs estimated).
 
 **Gate behavior:** compare `estimated_cost` to `triage.auto_threshold`. Above → don't run; comment the estimate on the issue and label `idle:needs-human`. Below → proceed.
 

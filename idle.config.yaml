@@ -10,6 +10,8 @@ labels:
 
 triage:
   auto_threshold_usd: 50          # above this, park for a human pre-run
+  prefilter_multiplier: 2.0       # skip the planning pass when the heuristic already
+                                  # prices a ticket above auto_threshold_usd * this
 
 budget:
   max_iterations: 20              # per ticket
@@ -40,6 +42,12 @@ pricing:                          # USD per 1M tokens (claude-opus-4-8)
 estimator:
   use_learned: false              # v2 regression; flip on once enough rows exist
   min_rows_for_learned: 20
+
+planner:                          # deterministic estimate via a cheap planning pass
+  enabled: true                   # false -> always use the zero-token heuristic
+  model: null                     # planning model; null -> inherit `model` above
+  timeout_s: 600                  # planning is short; capped well under the impl wall
+  margin_fraction: 0.25           # cost band width as a fraction of the estimate
 
 harness:                          # agents run via the Claude Code CLI (no API key)
   backend: "claude_code"

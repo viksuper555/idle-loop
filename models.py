@@ -34,7 +34,7 @@ class Decision(StrEnum):
 # Tickets
 # --------------------------------------------------------------------------- #
 _AC_HEADER = re.compile(
-    r"^\s*#{1,6}?\s*(acceptance criteria|acceptance|done when|definition of done)\s*:?\s*$",
+    r"^\s*(?:#{1,6}\s*)?(acceptance criteria|acceptance|ac|done when|definition of done)\s*:?\s*$",
     re.IGNORECASE,
 )
 _BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*\S)\s*$")
@@ -136,6 +136,9 @@ class EstimateResult:
     confidence: float  # 0..1
     features: EstimateFeatures
     margin: float = 0.0  # +/- dollar band
+    estimated_input_tokens: int = 0
+    estimated_output_tokens: int = 0
+    source: str = "heuristic"  # "planner" (deterministic) | "heuristic" (fallback)
 
     def band(self) -> str:
         """Render as ``~$30 ± $20`` — never false precision."""
@@ -144,6 +147,25 @@ class EstimateResult:
         if margin <= 0:
             return f"~${center}"
         return f"~${center} ± ${margin}"
+
+    @property
+    def estimated_tokens(self) -> int:
+        """Total estimated token budget (0 when the estimate is heuristic)."""
+        return self.estimated_input_tokens + self.estimated_output_tokens
+
+
+def format_tokens(n: int) -> str:
+    """Compact human token count: 950 -> '950', 46_000 -> '46k', 1_230_000 -> '1.23M'."""
+    n = max(0, int(n))
+    if n < 1_000:
+        return str(n)
+    if n < 1_000_000:
+        thousands = n / 1_000.0
+        # whole-thousands and big values read fine as ints; small fractions keep one decimal
+        if n % 1_000 == 0 or n >= 10_000:
+            return f"{thousands:.0f}k"
+        return f"{thousands:.1f}k"
+    return f"{n / 1_000_000.0:.2f}M"
 
 
 # --------------------------------------------------------------------------- #

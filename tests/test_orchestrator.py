@@ -13,6 +13,7 @@ import pytest
 
 import idle_loop
 from agents.harness import HarnessRateLimited
+from agents.planner import PlanResult
 from config import Config
 from idle_loop import EXIT_RATE_LIMITED, Orchestrator
 from models import (
@@ -120,6 +121,19 @@ class FakeReviewer:
         return self.verdict
 
 
+class FakePlanner:
+    def __init__(self, result: PlanResult | None = None, raises=None):
+        self.result = result
+        self.raises = raises
+        self.calls: list[tuple[int, str]] = []
+
+    def plan(self, ticket: Ticket, repo_dir: str) -> PlanResult | None:
+        self.calls.append((ticket.number, repo_dir))
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+
 class FakeGuard:
     def __init__(self, name: str, passed: bool, reason: str = ""):
         self.name = name
@@ -169,7 +183,7 @@ def good_impl(cost=10.0) -> ImplementationResult:
     )
 
 
-def make_orch(tmp_path, *, issues, guards=None, verdict=None, impl=None, **cfg_over):
+def make_orch(tmp_path, *, issues, guards=None, verdict=None, impl=None, planner=None, **cfg_over):
     from guards.estimate import Estimator
 
     cfg = make_config(tmp_path, **cfg_over)
@@ -187,6 +201,7 @@ def make_orch(tmp_path, *, issues, guards=None, verdict=None, impl=None, **cfg_o
         config=cfg,
         github=gh,
         estimator=estimator,
+        planner=planner,
         implementer=implementer,
         reviewer=reviewer,
         guards=guards,
@@ -563,13 +578,95 @@ def test_cost_chip_tracks_each_revision(tmp_path):
     # Estimate + two iteration updates (initial $4, revision -> $8 total).
     spend_updates = [b for _, _, b in gh.upsert_calls if "cost so far" in b]
     assert "$4.00" in spend_updates[0]
-    assert "$8.00" in gh.sticky[(1, idle_loop.COST_CHIP_MARKER)]
+    final = gh.sticky[(1, idle_loop.COST_CHIP_MARKER)]
+    assert "$8.00" in final
+    # Tokens are cumulative too: 2 x (1000 + 500) = 3000 -> "3k".
+    assert "3k" in final
 
 
 def test_dry_run_posts_no_cost_chip(tmp_path):
     orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
     orch.run(dry_run=True)
     assert gh.upsert_calls == [] and gh.sticky == {}
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic planner-based estimate
+# --------------------------------------------------------------------------- #
+def _plan(ein=1_000_000, eout=200_000) -> PlanResult:
+    return PlanResult(
+        estimated_input_tokens=ein,
+        estimated_output_tokens=eout,
+        plan_text="p",
+        session_id="s",
+    )
+
+
+def test_planner_estimate_is_deterministic_and_shown_on_chip(tmp_path):
+    # cost = cost_for_tokens(1M, 200k) = 1.0*5 + 0.2*25 = $10; tokens est = 1.2M.
+    planner = FakePlanner(_plan(1_000_000, 200_000))
+    orch, gh, implementer, _ = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False, planner=planner
+    )
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.MERGED
+    assert planner.calls == [(1, str(tmp_path))]
+    assert rec.estimated_cost == pytest.approx(10.0)  # deterministic from tokens
+    final = gh.sticky[(1, idle_loop.COST_CHIP_MARKER)]
+    assert "idle-loop tokens" in final and "est 1.20M" in final
+
+
+def test_planner_failure_falls_back_to_heuristic(tmp_path):
+    planner = FakePlanner(result=None)  # unparseable budget -> None
+    orch, gh, implementer, _ = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False, planner=planner
+    )
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.MERGED
+    assert planner.calls == [(1, str(tmp_path))]  # the planner WAS tried
+    # Heuristic estimate carries no token budget -> the tokens badge reads "n/a".
+    assert "est n/a" in gh.sticky[(1, idle_loop.COST_CHIP_MARKER)]
+
+
+def test_resume_guard_skips_planning_when_session_exists(tmp_path):
+    # A pre-existing session means the implementer is mid-flight; don't re-plan.
+    from agents.implementer import save_session
+
+    save_session(str(tmp_path), "sess-existing")
+    planner = FakePlanner(_plan())
+    orch, gh, implementer, _ = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False, planner=planner
+    )
+    orch.process_ticket(ticket(1))
+    assert planner.calls == []  # planning skipped to preserve the live session
+
+
+def test_prefilter_skips_planning_for_obvious_park(tmp_path):
+    # threshold=1.0 -> prefilter=$2.0; the heuristic prices a normal ticket well
+    # above that, so the ticket parks without paying for a planning pass.
+    planner = FakePlanner(_plan())
+    orch, gh, implementer, _ = make_orch(
+        tmp_path, issues=[ticket(1)], threshold=1.0, planner=planner
+    )
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.SKIPPED
+    assert planner.calls == []  # never planned
+
+
+def test_planner_rate_limit_propagates(tmp_path):
+    planner = FakePlanner(raises=HarnessRateLimited(reset_at=1.0, reset_human="usage limit"))
+    orch, gh, implementer, _ = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False, planner=planner
+    )
+    with pytest.raises(HarnessRateLimited):
+        orch.process_ticket(ticket(1))
+
+
+def test_dry_run_does_not_invoke_planner(tmp_path):
+    planner = FakePlanner(_plan())
+    orch, gh, implementer, _ = make_orch(tmp_path, issues=[ticket(1)], planner=planner)
+    orch.run(dry_run=True)
+    assert planner.calls == []
 
 
 def test_branch_pushed_before_pr(tmp_path):

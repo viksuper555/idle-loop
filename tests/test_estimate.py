@@ -16,7 +16,7 @@ from config import Config, Pricing, Triage
 from config import Estimator as EstimatorCfg
 from guards.base import GuardContext
 from guards.estimate import EstimateGuard, Estimator
-from models import EstimateResult, Ticket
+from models import EstimateResult, Ticket, format_tokens
 
 
 # --------------------------------------------------------------------------- #
@@ -345,3 +345,35 @@ def test_learned_path_fits_when_sklearn_present(monkeypatch, tmp_path):
     cost, iters = learned
     assert cost > 0
     assert iters >= 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic helpers (pricing + token formatting + estimate source)
+# --------------------------------------------------------------------------- #
+def test_cost_for_tokens_blends_input_and_output_rates():
+    p = Pricing(input_per_mtok=5.0, output_per_mtok=25.0)
+    assert p.cost_for_tokens(1_000_000, 1_000_000) == pytest.approx(30.0)
+    assert p.cost_for_tokens(0, 0) == 0.0
+    assert p.cost_for_tokens(1_000_000, 200_000) == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize(
+    "n,expected",
+    [
+        (0, "0"),
+        (950, "950"),
+        (8000, "8k"),
+        (2500, "2.5k"),
+        (46000, "46k"),
+        (1_230_000, "1.23M"),
+    ],
+)
+def test_format_tokens(n, expected):
+    assert format_tokens(n) == expected
+
+
+def test_heuristic_estimate_declares_no_token_budget():
+    # The estimator itself is dollar-only: source "heuristic", zero token budget.
+    est = Estimator(make_config()).estimate(make_ticket(criteria=["a", "b"]))
+    assert est.source == "heuristic"
+    assert est.estimated_tokens == 0
