@@ -8,6 +8,7 @@ logic (triage, parking, merge gate, global cap, cost logging) in isolation.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -750,10 +751,62 @@ def test_branch_dedupes_when_canonical_name_is_taken(tmp_path):
     orch, gh, implementer, reviewer = make_orch(
         tmp_path, issues=[ticket(1)], require_human=False
     )
-    # Pretend the canonical branch already exists -> dedupe to "-b".
+    # Canonical head exists but carries NO idle-loop ownership marker (no
+    # worktree, no pr_watch, no open PR) -> unrelated work -> dedupe to "-b".
     orch._branch_exists = lambda name: name == "feature/issue-1"
     orch.process_ticket(ticket(1))
     assert implementer.calls[0][2] == "feature/issue-1-b"
+
+
+# --------------------------------------------------------------------------- #
+# Resume on the existing branch instead of deduping to -b/-c (#26)
+# --------------------------------------------------------------------------- #
+def test_branch_for_resumes_existing_branch_via_worktree(tmp_path):
+    # A worktree for the canonical name means we are resuming that effort —
+    # reuse the exact branch even though the head already exists (no -b).
+    orch, gh, _, _ = make_orch(tmp_path, issues=[ticket(1)])
+    canonical = "feature/issue-1"
+    os.makedirs(orch._worktree_path(canonical))
+    orch._branch_exists = lambda name: name == canonical
+    assert orch._branch_for(ticket(1)) == canonical
+
+
+def test_branch_for_resumes_via_open_pr_without_worktree(tmp_path):
+    # The observed bug: #N built on feature/issue-N in the MAIN checkout (no
+    # worktree) with an open PR. A later pass must resume it, not dedupe to -b.
+    orch, gh, _, _ = make_orch(tmp_path, issues=[ticket(1)])
+    canonical = "feature/issue-1"
+    gh.open_pr_by_head[canonical] = {"number": 7, "html_url": "https://gh/pr/7"}
+    orch._branch_exists = lambda name: name == canonical  # head exists, no worktree
+    assert orch._branch_for(ticket(1)) == canonical
+
+
+def test_branch_for_resumes_via_pr_watch_record(tmp_path):
+    orch, gh, _, _ = make_orch(tmp_path, issues=[ticket(1)])
+    canonical = "feature/issue-1"
+    orch._save_pr_watch({"5": {"issue": 1, "branch": canonical, "worktree": "x"}})
+    orch._branch_exists = lambda name: name == canonical
+    assert orch._branch_for(ticket(1)) == canonical
+
+
+def test_branch_for_dedupes_when_collision_is_unrelated_work(tmp_path):
+    # Canonical head taken, but no ownership marker ties it to this issue ->
+    # a genuine collision with unrelated work -> dedupe to a free -b name.
+    orch, gh, _, _ = make_orch(tmp_path, issues=[ticket(1)])
+    canonical = "feature/issue-1"
+    orch._branch_exists = lambda name: name == canonical
+    assert orch._branch_for(ticket(1)) == "feature/issue-1-b"
+
+
+def test_resumed_branch_and_worktree_path_agree(tmp_path):
+    # AC: branch selection and worktree selection must agree for a resumed
+    # ticket — the worktree the loop would use is the one that already exists.
+    orch, gh, _, _ = make_orch(tmp_path, issues=[ticket(1)])
+    canonical = "feature/issue-1"
+    os.makedirs(orch._worktree_path(canonical))
+    orch._branch_exists = lambda name: name == canonical
+    branch = orch._branch_for(ticket(1))
+    assert os.path.isdir(orch._worktree_path(branch))  # no orphan worktree
 
 
 def test_pr_body_runs_through_the_template(tmp_path):
