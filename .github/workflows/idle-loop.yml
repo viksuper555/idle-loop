@@ -33,3 +33,26 @@ jobs:
         run: ruff check .
       - name: Test
         run: python -m pytest
+
+  # Fail-closed safety net: a PR must never introduce a Claude session
+  # transcript (*.jsonl / .claude/projects/) or idle-loop session-state file.
+  # These are unscrubbed and may contain prompts, tool output and secrets.
+  transcript-guard:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the base ref to diff the PR's changed files against it.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Block session-transcript / session-file leaks
+        run: |
+          set -euo pipefail
+          BASE="${{ github.base_ref }}"
+          git fetch --no-tags --depth=1 origin "$BASE"
+          # The PR's changed-file set, against the base branch — not the whole tree.
+          git diff --name-only "origin/${BASE}...HEAD" \
+            | python -m guards.transcript_leak
