@@ -408,3 +408,84 @@ def test_pr_status_for_branch_done(monkeypatch):
 def test_pr_status_for_branch_none(monkeypatch):
     client, _ = make_client(monkeypatch, [FakeResponse(200, [])])
     assert client.pr_status_for_branch("idle/issue-3") == "none"
+
+
+def test_list_pull_requests_by_label_filters_to_prs(monkeypatch):
+    # The issues endpoint returns issues + PRs; only entries with pull_request count.
+    client, session = make_client(
+        monkeypatch,
+        [
+            FakeResponse(
+                200,
+                [
+                    {"number": 1, "title": "plain issue"},
+                    {"number": 2, "title": "a PR", "pull_request": {"url": "..."}},
+                ],
+            )
+        ],
+    )
+    out = client.list_pull_requests_by_label("idle:listen")
+    assert out == [{"number": 2, "title": "a PR"}]
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "https://api.github.com/repos/owner/name/issues"
+    assert call["params"] == {"state": "open", "labels": "idle:listen", "per_page": 100}
+
+
+def test_get_pull_request_parses_head_branch(monkeypatch):
+    client, session = make_client(
+        monkeypatch,
+        [
+            FakeResponse(
+                200,
+                {
+                    "number": 7,
+                    "head": {"ref": "idle/issue-4"},
+                    "state": "open",
+                    "html_url": "https://gh/pr/7",
+                },
+            )
+        ],
+    )
+    out = client.get_pull_request(7)
+    assert out == {
+        "number": 7,
+        "head_branch": "idle/issue-4",
+        "state": "open",
+        "html_url": "https://gh/pr/7",
+    }
+    assert session.calls[0]["url"] == "https://api.github.com/repos/owner/name/pulls/7"
+
+
+def test_list_reviews_normalizes_fields(monkeypatch):
+    client, session = make_client(
+        monkeypatch,
+        [
+            FakeResponse(
+                200,
+                [
+                    {
+                        "id": 100,
+                        "state": "CHANGES_REQUESTED",
+                        "body": "fix this",
+                        "user": {"login": "alice"},
+                        "submitted_at": "2026-01-01T00:00:00Z",
+                    },
+                    {"id": 101, "state": "APPROVED", "body": None, "user": None},
+                ],
+            )
+        ],
+    )
+    out = client.list_reviews(7)
+    assert out[0] == {
+        "id": 100,
+        "state": "CHANGES_REQUESTED",
+        "body": "fix this",
+        "user": "alice",
+        "submitted_at": "2026-01-01T00:00:00Z",
+    }
+    # Missing body/user degrade to "" rather than None.
+    assert out[1]["body"] == "" and out[1]["user"] == ""
+    call = session.calls[0]
+    assert call["url"] == "https://api.github.com/repos/owner/name/pulls/7/reviews"
+    assert call["params"] == {"per_page": 100}

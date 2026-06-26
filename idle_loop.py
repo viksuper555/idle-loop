@@ -63,6 +63,10 @@ RATE_LIMIT_STATE = ".idle-loop/rate_limit.json"
 # Directory (under repo_dir) holding the per-ticket git worktrees used when
 # tickets are worked in parallel. Gitignored.
 WORKTREE_DIR = ".idle-worktrees"
+# State file (under repo_dir) mapping an open PR to the worktree + claude
+# session it was built in, plus the last review id we've acted on. This is what
+# lets `watch_reviews` resume the original context when a new review lands.
+PR_WATCH_STATE = ".idle-loop/pr_watch.json"
 
 
 class Orchestrator:
@@ -93,6 +97,9 @@ class Orchestrator:
         self._repo_tree_cache: list[str] | None = None
         # Serializes cost-log appends across parallel ticket workers.
         self._cost_log_lock = threading.Lock()
+        # Serializes PR-watch state read-modify-write across parallel workers,
+        # which all persist to the single central state file under repo_dir.
+        self._pr_watch_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -329,6 +336,10 @@ class Orchestrator:
                 f"open a PR (branch `{branch}`). Check the loop's git remote/permissions.",
             )
             return self._record(ticket, estimate, impl, Outcome.PARKED)
+
+        # Mark the fresh PR idle:listen and remember the worktree + session it was
+        # built in, so a later review can resume that same claude context.
+        self._listen_pr(ticket, pr, branch, repo_dir)
 
         # (7) Review against the acceptance criteria (separate agent/context),
         # then iterate on the SAME branch/PR: feed the reviewer's requested
@@ -668,7 +679,9 @@ class Orchestrator:
     def _ensure_labels(self) -> None:
         labels = self.config.labels
         try:
-            self.github.ensure_labels([labels.ready, labels.needs_human, labels.allow_sensitive])
+            self.github.ensure_labels(
+                [labels.ready, labels.needs_human, labels.allow_sensitive, labels.listen]
+            )
         except GitHubError as exc:
             self.log.warning("ensure_labels failed (continuing): %s", exc)
 
@@ -679,10 +692,21 @@ class Orchestrator:
             self.log.warning("comment on #%s failed: %s", ticket.number, exc)
 
     def _label(self, ticket: Ticket, label: str) -> None:
+        self._label_num(ticket.number, label)
+
+    def _label_num(self, number: int, label: str) -> None:
+        """Add ``label`` to issue/PR ``number`` (labels share the issues API)."""
         try:
-            self.github.add_label(ticket.number, label)
+            self.github.add_label(number, label)
         except GitHubError as exc:
-            self.log.warning("add_label %s on #%s failed: %s", label, ticket.number, exc)
+            self.log.warning("add_label %s on #%s failed: %s", label, number, exc)
+
+    def _comment_num(self, number: int, body: str) -> None:
+        """Comment on issue/PR ``number`` (PR comments share the issues API)."""
+        try:
+            self.github.comment(number, body)
+        except GitHubError as exc:
+            self.log.warning("comment on #%s failed: %s", number, exc)
 
     def _park(self, ticket: Ticket, reason: str) -> None:
         """Comment a crisp reason and flag the ticket for a human."""
@@ -753,6 +777,268 @@ class Orchestrator:
         except GitHubError as exc:
             self.log.warning("merge PR #%s failed: %s", pr.get("number"), exc)
             return False
+
+    # ------------------------------------------------------------------ #
+    # PR review watching (AC: "watch for PR reviews")
+    # ------------------------------------------------------------------ #
+    def _pr_watch_path(self) -> str:
+        return os.path.join(self.repo_dir, PR_WATCH_STATE)
+
+    def _load_pr_watch(self) -> dict[str, dict]:
+        """Load the PR -> {worktree, session, last_review_id, ...} map (best-effort)."""
+        try:
+            with open(self._pr_watch_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_pr_watch(self, state: dict[str, dict]) -> None:
+        """Persist the PR-watch map (best-effort; never fatal)."""
+        try:
+            path = self._pr_watch_path()
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+        except OSError as exc:
+            self.log.warning("could not write PR-watch state: %s", exc)
+
+    def _listen_pr(
+        self, ticket: Ticket, pr: dict, branch: str, repo_dir: str
+    ) -> None:
+        """Label a freshly opened PR ``idle:listen`` and record how to resume it.
+
+        The claude session id is read from the worktree (it was saved by the
+        implementer) and stored alongside the worktree path so a later review can
+        spawn an implementer that resumes the same context.
+        """
+        from agents.implementer import load_session
+
+        number = pr.get("number")
+        if number is None:
+            return
+        number = int(number)
+        self._label_num(number, self.config.labels.listen)
+
+        reviews = self._safe_list_reviews(number)
+        last_review_id = max((r["id"] for r in reviews), default=0)
+
+        with self._pr_watch_lock:
+            state = self._load_pr_watch()
+            state[str(number)] = {
+                "issue": ticket.number,
+                "branch": branch,
+                "worktree": repo_dir,
+                "session_id": load_session(repo_dir) or "",
+                "last_review_id": last_review_id,
+                "attempts": 0,
+            }
+            self._save_pr_watch(state)
+
+    def _safe_list_reviews(self, number: int) -> list[dict]:
+        try:
+            return self.github.list_reviews(number)
+        except GitHubError as exc:
+            self.log.warning("list_reviews for PR #%s failed: %s", number, exc)
+            return []
+
+    @staticmethod
+    def _review_actionable(review: dict) -> bool:
+        """Whether a review asks for work: changes requested, or a non-empty comment.
+
+        Approvals and dismissals carry no action — we only advance past them.
+        """
+        state = (review.get("state") or "").upper()
+        if state == "CHANGES_REQUESTED":
+            return True
+        if state == "COMMENTED" and (review.get("body") or "").strip():
+            return True
+        return False
+
+    def watch_reviews(self) -> list[int]:
+        """Address new reviews on every open ``idle:listen`` PR. Returns PRs acted on.
+
+        For each watched PR we fetch its reviews; any review newer than the last
+        one we handled that asks for changes triggers a resume of the PR's
+        original claude context (via the saved worktree session) so the
+        implementer revises the branch in place. A PR is deferred to a human
+        (``idle:listen`` dropped, ``idle:needs-human`` added) once it exhausts
+        ``budget.review_iterations`` or a guard fails on a revision.
+        """
+        listen = self.config.labels.listen
+        try:
+            prs = self.github.list_pull_requests_by_label(listen)
+        except GitHubError as exc:
+            self.log.warning("listing %s PRs failed: %s", listen, exc)
+            return []
+
+        self.log.info("watching %d PR(s) labelled %s", len(prs), listen)
+        state = self._load_pr_watch()
+        acted: list[int] = []
+
+        try:
+            for pr in prs:
+                number = pr["number"]
+                rec = state.get(str(number)) or self._seed_pr_record(number)
+                if rec is None:
+                    continue
+
+                reviews = self._safe_list_reviews(number)
+                last_seen = int(rec.get("last_review_id", 0))
+                new_reviews = [r for r in reviews if r["id"] > last_seen]
+                if not new_reviews:
+                    state[str(number)] = rec
+                    continue
+
+                # Advance the cursor regardless of whether any review was
+                # actionable, so an approval/comment isn't re-examined next poll.
+                rec["last_review_id"] = max(r["id"] for r in reviews)
+                actionable = [r for r in new_reviews if self._review_actionable(r)]
+                if actionable:
+                    self.log.info(
+                        "#PR%s: %d new actionable review(s) -> resuming context",
+                        number,
+                        len(actionable),
+                    )
+                    if self._address_pr_review(number, rec, actionable):
+                        acted.append(number)
+                    if rec.get("_deferred"):
+                        state.pop(str(number), None)
+                        continue
+                state[str(number)] = rec
+        except HarnessRateLimited as exc:
+            # Persist progress and the reset time, then stop so the listener can
+            # reschedule — exactly as the ticket pass does.
+            self._save_pr_watch(state)
+            self._on_rate_limit(exc)
+            raise
+
+        self._save_pr_watch(state)
+        return acted
+
+    def _seed_pr_record(self, number: int) -> dict | None:
+        """Build a watch record for a PR labelled externally (no saved state).
+
+        Derives the issue/worktree from the PR's head branch (``idle/issue-N``);
+        returns ``None`` when the branch isn't one idle-loop owns, so we never try
+        to resume context we don't have.
+        """
+        try:
+            pr = self.github.get_pull_request(number)
+        except GitHubError as exc:
+            self.log.warning("get_pull_request #%s failed: %s", number, exc)
+            return None
+        branch = pr.get("head_branch", "")
+        prefix = "idle/issue-"
+        if not branch.startswith(prefix):
+            self.log.info("#PR%s head %r not idle-owned; skipping", number, branch)
+            return None
+        try:
+            issue = int(branch[len(prefix):])
+        except ValueError:
+            return None
+        from agents.implementer import load_session
+
+        worktree = self._worktree_path(issue)
+        return {
+            "issue": issue,
+            "branch": branch,
+            "worktree": worktree,
+            "session_id": load_session(worktree) or "",
+            "last_review_id": 0,
+            "attempts": 0,
+        }
+
+    def _address_pr_review(
+        self, number: int, rec: dict, reviews: list[dict]
+    ) -> bool:
+        """Resume the PR's context and revise the branch to address ``reviews``.
+
+        Returns whether a revision was actually run. Mutates ``rec`` in place
+        (attempt count, ``_deferred`` flag). Bounded by ``review_iterations``:
+        once exhausted, or if a guard fails / push fails, the PR is deferred.
+        """
+        if rec.get("attempts", 0) >= self.config.budget.review_iterations:
+            self._defer_pr(
+                number,
+                rec,
+                "idle-loop has used its review-revision budget on this PR; "
+                "the latest review needs a human.",
+            )
+            return False
+
+        try:
+            ticket = self.github.get_issue(rec["issue"])
+        except GitHubError as exc:
+            self.log.warning("get_issue #%s for PR #%s failed: %s", rec.get("issue"), number, exc)
+            return False
+
+        worktree = rec["worktree"]
+        branch = rec["branch"]
+        feedback = _pr_review_feedback(reviews)
+        impl = self.implementer.run(ticket, worktree, branch, feedback=feedback)
+        rec["attempts"] = rec.get("attempts", 0) + 1
+        self.log.info(
+            "#PR%s revised: %d files, %d iters, $%.2f%s",
+            number,
+            len(impl.files_changed),
+            impl.iterations,
+            impl.cost_usd,
+            " [error]" if impl.error else "",
+        )
+
+        # Re-run guards on the revised diff — a revision that breaks scope/tests
+        # is deferred rather than pushed.
+        ctx = GuardContext(
+            ticket=ticket,
+            config=self.config,
+            repo_dir=worktree,
+            diff=impl.diff,
+            files_changed=impl.files_changed,
+            implementation=impl,
+        )
+        results = run_all(self.guards, ctx)
+        failed = next((r for r in results if not r.passed), None)
+        if failed is not None:
+            self._defer_pr(
+                number,
+                rec,
+                f"a guard failed while addressing the review: **`{failed.name}`** — {failed.reason}",
+            )
+            return True
+
+        if not self.implementer.push_branch(worktree, branch):
+            self._defer_pr(
+                number,
+                rec,
+                f"idle-loop revised the PR but could not push branch `{branch}`.",
+            )
+            return True
+
+        self._comment(
+            ticket,
+            f"🤖 **idle-loop addressed the latest review on this PR** "
+            f"(revision {rec['attempts']}/{self.config.budget.review_iterations}).\n\n{SHIPPED_BY}",
+        )
+        return True
+
+    def _defer_pr(self, number: int, rec: dict, reason: str) -> None:
+        """Hand a watched PR back to a human: drop idle:listen, flag needs-human.
+
+        Marks ``rec`` deferred so the caller drops it from the watch state.
+        """
+        labels = self.config.labels
+        try:
+            self.github.remove_label(number, labels.listen)
+        except GitHubError as exc:
+            self.log.warning("remove %s from PR #%s failed: %s", labels.listen, number, exc)
+        self._label_num(number, labels.needs_human)
+        self._comment_num(
+            number,
+            f"🅿️ **idle-loop deferred this PR to a human.**\n\n{reason}\n\n{SHIPPED_BY}",
+        )
+        rec["_deferred"] = True
+        self.log.info("#PR%s deferred to human: %s", number, reason)
 
     # ------------------------------------------------------------------ #
     # Cost log
@@ -873,6 +1159,19 @@ def _review_feedback(verdict: ReviewVerdict) -> str:
     return "\n".join(lines) if lines else "The reviewer requested changes."
 
 
+def _pr_review_feedback(reviews: list[dict]) -> str:
+    """Render one or more GitHub PR reviews as actionable implementer feedback."""
+    lines: list[str] = []
+    for r in reviews:
+        who = r.get("user") or "a reviewer"
+        state = (r.get("state") or "").replace("_", " ").lower()
+        body = (r.get("body") or "").strip()
+        header = f"{who} ({state}):" if state else f"{who}:"
+        lines.append(f"{header} {body}" if body else header)
+    joined = "\n".join(lines).strip()
+    return joined or "A reviewer requested changes on the PR."
+
+
 def _estimate_detail(estimate: EstimateResult) -> str:
     f = estimate.features
     return (
@@ -943,6 +1242,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="create/update the idle:* labels on the repo and exit "
         "(no loop, no harness — needs only a GitHub token)",
     )
+    parser.add_argument(
+        "--watch-reviews",
+        action="store_true",
+        help="check open idle:listen PRs for new reviews and address requested "
+        "changes by resuming each PR's saved context, then exit (no ticket pass)",
+    )
     return parser
 
 
@@ -953,7 +1258,7 @@ def ensure_labels(config: Config) -> list[str]:
     CI — the only loop side effect that's static and safe to run unattended.
     """
     labels = config.labels
-    names = [labels.ready, labels.needs_human, labels.allow_sensitive]
+    names = [labels.ready, labels.needs_human, labels.allow_sensitive, labels.listen]
     GitHubClient(config.repo).ensure_labels(names)
     log.info("ensured labels on %s: %s", config.repo, ", ".join(names))
     return names
@@ -973,11 +1278,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     orch = Orchestrator.from_config(config, repo_dir=args.repo_dir)
     try:
-        orch.run(
-            max_tickets=args.max_tickets,
-            dry_run=args.dry_run,
-            max_parallel=args.max_parallel,
-        )
+        if args.watch_reviews:
+            orch.watch_reviews()
+        else:
+            orch.run(
+                max_tickets=args.max_tickets,
+                dry_run=args.dry_run,
+                max_parallel=args.max_parallel,
+            )
     except HarnessRateLimited:
         # State + marker already emitted by Orchestrator._on_rate_limit.
         return EXIT_RATE_LIMITED

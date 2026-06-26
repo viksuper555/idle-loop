@@ -43,9 +43,30 @@ class FakeGitHub:
         self.sticky: dict[tuple[int, str], str] = {}
         self.upsert_calls: list[tuple[int, str, str]] = []
         self._pr_seq = 0
+        # PR-review watching fixtures.
+        self.labelled_prs: dict[str, list[dict]] = {}  # label -> [{number, title}]
+        self.reviews: dict[int, list[dict]] = {}  # pr number -> [review dicts]
+        self.pr_details: dict[int, dict] = {}  # pr number -> get_pull_request payload
 
     def list_ready_issues(self, label: str) -> list[Ticket]:
         return list(self.issues)
+
+    def get_issue(self, number: int) -> Ticket:
+        for t in self.issues:
+            if t.number == number:
+                return t
+        return Ticket(number=number, title=f"#{number}", body="", labels=[])
+
+    def list_pull_requests_by_label(self, label: str) -> list[dict]:
+        return list(self.labelled_prs.get(label, []))
+
+    def list_reviews(self, number: int) -> list[dict]:
+        return list(self.reviews.get(number, []))
+
+    def get_pull_request(self, number: int) -> dict:
+        return self.pr_details.get(
+            number, {"number": number, "head_branch": "", "state": "open", "html_url": ""}
+        )
 
     def comment(self, number: int, body: str) -> None:
         self.comments.append((number, body))
@@ -232,7 +253,9 @@ def test_run_ensures_idle_labels_before_processing(tmp_path):
         tmp_path, issues=[ticket(1)], require_human=False
     )
     orch.run()
-    assert gh.ensured == [["idle:ready", "idle:needs-human", "idle:allow-sensitive"]]
+    assert gh.ensured == [
+        ["idle:ready", "idle:needs-human", "idle:allow-sensitive", "idle:listen"]
+    ]
 
 
 def test_ticket_without_acceptance_criteria_is_skipped(tmp_path):
@@ -523,7 +546,12 @@ def test_ensure_labels_syncs_without_running_loop(monkeypatch):
     rc = idle_loop.main(["--ensure-labels"])
     assert rc == idle_loop.EXIT_OK
     assert recorded["repo"] == "o/n"
-    assert recorded["names"] == ["idle:ready", "idle:needs-human", "idle:allow-sensitive"]
+    assert recorded["names"] == [
+        "idle:ready",
+        "idle:needs-human",
+        "idle:allow-sensitive",
+        "idle:listen",
+    ]
 
 
 def test_cost_chip_posted_on_estimate_then_updated_with_spend(tmp_path):
@@ -689,3 +717,176 @@ def test_failed_push_parks_without_pr(tmp_path):
     assert gh.prs == [] and gh.merged == []  # no PR opened, nothing merged
     assert reviewer.calls == []  # never reached review
     assert (1, "idle:needs-human") in gh.added_labels
+
+
+# --------------------------------------------------------------------------- #
+# PR review watching (ticket #7)
+# --------------------------------------------------------------------------- #
+def _review(id_, state, body="", user="alice"):
+    return {"id": id_, "state": state, "body": body, "user": user, "submitted_at": ""}
+
+
+def test_open_pr_marks_listen_and_records_watch_state(tmp_path):
+    # Opening a PR labels it idle:listen and records how to resume its context.
+    from agents.implementer import save_session
+
+    save_session(str(tmp_path), "sess-pr")  # the implementer "saved" a session
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=True
+    )
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.PARKED  # require_human keeps the PR open
+    pr_number = gh.prs[0]["number"]
+    assert (pr_number, "idle:listen") in gh.added_labels
+
+    state = orch._load_pr_watch()
+    saved = state[str(pr_number)]
+    assert saved["issue"] == 1
+    assert saved["branch"] == "idle/issue-1"
+    assert saved["worktree"] == str(tmp_path)
+    assert saved["session_id"] == "sess-pr"  # auto-saved on PR creation
+    assert saved["last_review_id"] == 0  # no reviews yet
+
+
+def _seed_watch(orch, pr_number, *, issue=1, branch="idle/issue-1", worktree=None,
+                last_review_id=0, attempts=0):
+    state = orch._load_pr_watch()
+    state[str(pr_number)] = {
+        "issue": issue,
+        "branch": branch,
+        "worktree": worktree or orch.repo_dir,
+        "session_id": "sess",
+        "last_review_id": last_review_id,
+        "attempts": attempts,
+    }
+    orch._save_pr_watch(state)
+
+
+def test_watch_reviews_addresses_new_changes_requested(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = [_review(100, "CHANGES_REQUESTED", body="add a test for Y")]
+    _seed_watch(orch, 5, last_review_id=0)
+
+    acted = orch.watch_reviews()
+
+    assert acted == [5]
+    # The implementer was resumed in the PR's worktree with the review feedback.
+    assert implementer.calls == [(1, str(tmp_path), "idle/issue-1")]
+    assert implementer.feedbacks[-1] and "add a test for Y" in implementer.feedbacks[-1]
+    assert (str(tmp_path), "idle/issue-1") in implementer.pushed
+    # Cursor advanced + attempt counted, so the same review won't re-trigger.
+    state = orch._load_pr_watch()
+    assert state["5"]["last_review_id"] == 100
+    assert state["5"]["attempts"] == 1
+
+
+def test_watch_reviews_ignores_approval(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = [_review(100, "APPROVED", body="lgtm")]
+    _seed_watch(orch, 5, last_review_id=0)
+
+    acted = orch.watch_reviews()
+
+    assert acted == []
+    assert implementer.calls == []  # nothing to address
+    # But the cursor still advances so we don't re-examine the approval.
+    assert orch._load_pr_watch()["5"]["last_review_id"] == 100
+
+
+def test_watch_reviews_no_new_reviews_is_a_noop(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = [_review(100, "CHANGES_REQUESTED", body="fix")]
+    _seed_watch(orch, 5, last_review_id=100)  # already handled review 100
+
+    acted = orch.watch_reviews()
+
+    assert acted == [] and implementer.calls == []
+
+
+def test_watch_reviews_defers_after_review_iterations(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    orch.config.budget.review_iterations = 2
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = [_review(101, "CHANGES_REQUESTED", body="still wrong")]
+    _seed_watch(orch, 5, last_review_id=100, attempts=2)  # budget exhausted
+
+    orch.watch_reviews()
+
+    assert implementer.calls == []  # no further revision
+    assert (5, "idle:listen") in gh.removed_labels  # handed back to a human
+    assert (5, "idle:needs-human") in gh.added_labels
+    # Deferred PRs drop out of the watch state.
+    assert "5" not in orch._load_pr_watch()
+
+
+def test_watch_reviews_defers_when_guard_fails_on_revision(tmp_path):
+    guards = [FakeGuard("scope", False, "diff too large")]
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], guards=guards
+    )
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = [_review(100, "CHANGES_REQUESTED", body="fix")]
+    _seed_watch(orch, 5, last_review_id=0)
+
+    acted = orch.watch_reviews()
+
+    assert acted == [5]  # a revision was attempted
+    assert implementer.calls  # implementer ran
+    assert (5, "idle:listen") in gh.removed_labels  # but guard failure defers it
+    assert (5, "idle:needs-human") in gh.added_labels
+
+
+def test_watch_reviews_seeds_unknown_pr_from_branch(tmp_path):
+    # A PR labelled idle:listen with no saved state is seeded from its head branch.
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    gh.labelled_prs["idle:listen"] = [{"number": 9, "title": "x"}]
+    gh.pr_details[9] = {
+        "number": 9,
+        "head_branch": "idle/issue-1",
+        "state": "open",
+        "html_url": "",
+    }
+    gh.reviews[9] = [_review(100, "CHANGES_REQUESTED", body="seed me")]
+
+    acted = orch.watch_reviews()
+
+    assert acted == [9]
+    assert implementer.calls == [(1, orch._worktree_path(1), "idle/issue-1")]
+
+
+def test_watch_reviews_skips_non_idle_branch(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    gh.labelled_prs["idle:listen"] = [{"number": 9, "title": "x"}]
+    gh.pr_details[9] = {
+        "number": 9,
+        "head_branch": "feature/not-ours",
+        "state": "open",
+        "html_url": "",
+    }
+    gh.reviews[9] = [_review(100, "CHANGES_REQUESTED", body="nope")]
+
+    acted = orch.watch_reviews()
+
+    assert acted == [] and implementer.calls == []
+
+
+def test_main_watch_reviews_flag_calls_watch(tmp_path, monkeypatch):
+    called = {}
+
+    class Spy:
+        def watch_reviews(self):
+            called["watched"] = True
+
+        def run(self, **k):  # must not be called
+            raise AssertionError("run() must not be called for --watch-reviews")
+
+    monkeypatch.setattr(idle_loop, "load_config", lambda p: Config(repo="o/n"))
+    monkeypatch.setattr(
+        idle_loop.Orchestrator, "from_config", classmethod(lambda cls, config, repo_dir=".": Spy())
+    )
+    rc = idle_loop.main(["--watch-reviews", "--repo-dir", str(tmp_path)])
+    assert rc == idle_loop.EXIT_OK
+    assert called.get("watched") is True

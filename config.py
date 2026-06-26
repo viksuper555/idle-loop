@@ -20,6 +20,10 @@ class Labels:
     ready: str = "idle:ready"
     needs_human: str = "idle:needs-human"
     allow_sensitive: str = "idle:allow-sensitive"
+    # Applied to a PR the moment idle-loop opens it; idle keeps watching the PR
+    # for new reviews while it carries this label, and drops it once the PR is
+    # deferred to a human (see Orchestrator.watch_reviews).
+    listen: str = "idle:listen"
 
 
 @dataclass
