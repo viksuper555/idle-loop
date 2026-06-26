@@ -109,14 +109,23 @@ session — then exits. Each cron-triggered run clears its own entry first, so t
 stacks.
 
 ```bash
-./idle-listener.sh -- --max-tickets 3   # run; auto-reschedules on rate limit
-./idle-listener.sh --status             # show the pending cron entry, if any
-./idle-listener.sh --uninstall          # cancel a pending reschedule
+./idle-listener.sh -- --max-tickets 3              # one pass; auto-reschedules on rate limit
+./idle-listener.sh --watch --interval 900 -- ...   # poll the board every 15 min, forever
+./idle-listener.sh --status                        # show pending cron entry / watch mode
+./idle-listener.sh --uninstall                     # cancel a pending reschedule + watch state
 ```
+
+`--watch` keeps polling for new `idle:ready` tickets every `--interval` seconds (default 600).
+A rate limit still parks to cron and resumes the watch when the window resets (watch mode is
+persisted across the cron hop). Without `--watch` it's a single backlog pass.
 
 Set `IDLE_PYTHON` if `python3` isn't your interpreter. On macOS the cron daemon may need Full
 Disk Access (System Settings → Privacy & Security), and `claude` must be on `PATH` (the listener
 bakes the resolved `PATH` into the cron entry).
+
+**From a Claude Code session**, the `/idle-loop` skill (`.claude/skills/idle-loop/`) is the manual
+front door — it walks dry-run estimates, label sync, and a bounded pass. The unattended daemon,
+though, is the listener + cron above (a skill only runs inside a session).
 
 ### CLI
 

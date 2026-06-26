@@ -11,12 +11,19 @@
 # schedule never stacks up.
 #
 # Usage:
-#   ./idle-listener.sh [-- <args passed to idle_loop.py>]
-#   ./idle-listener.sh --uninstall        # remove any pending cron entry
-#   ./idle-listener.sh --status           # show pending cron entry, if any
+#   ./idle-listener.sh [-- <args passed to idle_loop.py>]   # one pass
+#   ./idle-listener.sh --watch [--interval SECONDS] [-- <args>]  # poll forever
+#   ./idle-listener.sh --uninstall        # remove pending cron entry + watch state
+#   ./idle-listener.sh --status           # show pending cron entry / watch mode
 #   ./idle-listener.sh --from-cron [...]  # internal: invoked by cron
 #
-# Example: ./idle-listener.sh -- --max-tickets 3
+# Examples:
+#   ./idle-listener.sh -- --max-tickets 3
+#   ./idle-listener.sh --watch --interval 900 -- --repo-dir ../target-clone
+#
+# --watch keeps polling the board every INTERVAL seconds (default 600), working
+# new idle:ready tickets as they appear. A rate limit still parks to cron and
+# resumes the watch when the window resets.
 #
 # macOS note: the cron daemon may need Full Disk Access (System Settings ->
 # Privacy & Security) to run, and `claude` must be resolvable on PATH (this
@@ -42,7 +49,7 @@ CLAUDE_BIN="$(command -v claude || true)"
 
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
 
-usage() { sed -n '3,30p' "$SCRIPT" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR>=3 && /^#/ {sub(/^# ?/, ""); print; next} NR>=3 {exit}' "$SCRIPT"; }
 
 # --- crontab helpers ------------------------------------------------------- #
 remove_cron() {
@@ -96,13 +103,19 @@ reset_epoch() {  # echo the reset epoch from state, else a fallback
 
 # --- argument parsing ------------------------------------------------------ #
 FROM_CRON=0
+WATCH=0
+INTERVAL=600   # watch poll interval, seconds
+WATCH_FILE="$STATE_DIR/watch"
 LOOP_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
+    --watch) WATCH=1; shift ;;
+    --interval) INTERVAL="${2:?--interval needs a value in seconds}"; shift 2 ;;
     --from-cron) FROM_CRON=1; shift ;;
-    --uninstall) remove_cron; log "uninstalled"; exit 0 ;;
+    --uninstall) remove_cron; rm -f "$WATCH_FILE"; log "uninstalled"; exit 0 ;;
     --status)
       crontab -l 2>/dev/null | grep -F "$CRON_TAG" || echo "no pending idle-loop cron entry"
+      [ -f "$WATCH_FILE" ] && echo "watch mode persisted (interval $(cat "$WATCH_FILE")s)"
       exit 0 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; LOOP_ARGS=("$@"); break ;;
@@ -111,33 +124,52 @@ while [ $# -gt 0 ]; do
 done
 
 # A cron-triggered run clears the entry that fired (one-shot semantics) and
-# restores the loop args saved when it was scheduled.
+# restores the loop args + watch mode saved when it was scheduled.
 if [ "$FROM_CRON" -eq 1 ]; then
   remove_cron
   if [ ${#LOOP_ARGS[@]} -eq 0 ] && [ -f "$ARGS_FILE" ]; then
     mapfile -t LOOP_ARGS < "$ARGS_FILE" 2>/dev/null || true
   fi
+  if [ -f "$WATCH_FILE" ]; then
+    WATCH=1
+    INTERVAL="$(cat "$WATCH_FILE" 2>/dev/null || echo "$INTERVAL")"
+  fi
 fi
 
-# Persist loop args so a rescheduled run reuses them.
+# Persist loop args + watch mode so a rescheduled (cron) run resumes identically.
 : > "$ARGS_FILE"
 for a in "${LOOP_ARGS[@]:-}"; do [ -n "$a" ] && printf '%s\n' "$a" >> "$ARGS_FILE"; done
+if [ "$WATCH" -eq 1 ]; then printf '%s\n' "$INTERVAL" > "$WATCH_FILE"; else rm -f "$WATCH_FILE"; fi
 
 if [ -z "$PY" ]; then log "no python found (set IDLE_PYTHON)"; exit 127; fi
 if [ -z "$CLAUDE_BIN" ]; then log "WARNING: 'claude' not on PATH — the agents will fail"; fi
 
-# --- run one session ------------------------------------------------------- #
-log "starting idle-loop session (args: ${LOOP_ARGS[*]:-none})"
-set +e
-"$PY" idle_loop.py "${LOOP_ARGS[@]:-}" >> "$LOG" 2>&1
-rc=$?
-set -e
+# --- run loop -------------------------------------------------------------- #
+# One pass by default; with --watch, poll every INTERVAL seconds. A rate limit
+# always wins: park to cron at the reset time and exit (cron resumes us).
+trap 'log "stop signal received; exiting"; exit 0' INT TERM
 
-if [ "$rc" -eq "$RATE_LIMITED_EXIT" ]; then
-  log "rate-limited (exit $rc) — rescheduling"
-  schedule_cron "$(reset_epoch)"
-  exit 0
-fi
+[ "$WATCH" -eq 1 ] && log "watch mode: polling every ${INTERVAL}s (Ctrl-C to stop)"
 
-log "session ended (exit $rc); nothing rescheduled"
-exit "$rc"
+while true; do
+  log "starting idle-loop session (args: ${LOOP_ARGS[*]:-none})"
+  set +e
+  "$PY" idle_loop.py "${LOOP_ARGS[@]:-}" >> "$LOG" 2>&1
+  rc=$?
+  set -e
+
+  if [ "$rc" -eq "$RATE_LIMITED_EXIT" ]; then
+    log "rate-limited (exit $rc) — rescheduling via cron"
+    schedule_cron "$(reset_epoch)"
+    exit 0
+  fi
+
+  if [ "$WATCH" -eq 1 ]; then
+    log "session ended (exit $rc); next poll in ${INTERVAL}s"
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  log "session ended (exit $rc); nothing rescheduled"
+  exit "$rc"
+done
