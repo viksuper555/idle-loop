@@ -167,14 +167,14 @@ def test_session_is_persisted_then_resumed(monkeypatch, tmp_path):
 
 
 def test_run_with_no_session_succeeds_from_prompt_and_progress(monkeypatch, tmp_path):
-    # Cold start: no saved session. The run must still succeed end-to-end purely
-    # from prompt + PROGRESS.md + diff — --resume is demoted to an optimization.
+    # PROGRESS mode, cold start: no saved session and none is used. The run must
+    # still succeed end-to-end purely from prompt + PROGRESS.md + diff.
     monkeypatch.setattr(subprocess, "run", fake_git())
     (tmp_path / "PROGRESS.md").write_text(
         "# Progress — #1: t\n\n## Done\nseeded by planner\n", encoding="utf-8"
     )
     harness = FakeHarness(HarnessResult(text="done", cost_usd=0.3, num_turns=2))
-    impl = Implementer(Config(repo="o/n"), harness=harness)
+    impl = Implementer(Config(repo="o/n", progress_memory=True), harness=harness)
 
     res = impl.run(ticket(1), str(tmp_path), "idle/issue-1")
 
@@ -189,7 +189,7 @@ def test_progress_written_and_committed_after_turn(monkeypatch, tmp_path):
     calls: list[list[str]] = []
     monkeypatch.setattr(subprocess, "run", recording_git(calls))
     harness = FakeHarness(HarnessResult(text="implemented X", cost_usd=0.2, num_turns=2))
-    impl = Implementer(Config(repo="o/n"), harness=harness)
+    impl = Implementer(Config(repo="o/n", progress_memory=True), harness=harness)
 
     impl.run(ticket(7), str(tmp_path), "idle/issue-7")
 
@@ -206,7 +206,7 @@ def test_progress_written_and_committed_after_turn(monkeypatch, tmp_path):
 def test_progress_records_reviewer_asks_on_revision(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "run", fake_git())
     harness = FakeHarness()
-    Implementer(Config(repo="o/n"), harness=harness).run(
+    Implementer(Config(repo="o/n", progress_memory=True), harness=harness).run(
         ticket(1), str(tmp_path), "idle/issue-1", feedback="cover the Y case"
     )
     body = (tmp_path / "PROGRESS.md").read_text(encoding="utf-8")
@@ -219,7 +219,7 @@ def test_progress_prompt_includes_committed_contents(monkeypatch, tmp_path):
         "# Progress\n\n## Current approach\nuse a registry\n", encoding="utf-8"
     )
     harness = FakeHarness()
-    Implementer(Config(repo="o/n"), harness=harness).run(
+    Implementer(Config(repo="o/n", progress_memory=True), harness=harness).run(
         ticket(1), str(tmp_path), "idle/issue-1"
     )
     assert "use a registry" in harness.calls[0]["prompt"]
@@ -228,7 +228,7 @@ def test_progress_prompt_includes_committed_contents(monkeypatch, tmp_path):
 def test_progress_rule_states_prose_only(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "run", fake_git())
     harness = FakeHarness()
-    Implementer(Config(repo="o/n"), harness=harness).run(
+    Implementer(Config(repo="o/n", progress_memory=True), harness=harness).run(
         ticket(1), str(tmp_path), "idle/issue-1"
     )
     prompt = harness.calls[0]["prompt"].lower()
@@ -243,6 +243,22 @@ def test_progress_helpers_roundtrip(tmp_path):
     assert "stuff" in load_progress(str(tmp_path))
     write_progress(str(tmp_path), "")  # empty is a no-op, keeps prior
     assert "stuff" in load_progress(str(tmp_path))
+
+
+def test_resume_mode_does_not_author_progress(monkeypatch, tmp_path):
+    # Default config is RESUME mode (progress_memory=False): the run resumes the
+    # prior session and neither authors PROGRESS.md nor injects it into the prompt.
+    from agents.implementer import save_session
+
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    save_session(str(tmp_path), "sess-prior")
+    harness = FakeHarness(HarnessResult(text="done", cost_usd=0.1, num_turns=2))
+    Implementer(Config(repo="o/n"), harness=harness).run(
+        ticket(1), str(tmp_path), "idle/issue-1"
+    )
+    assert harness.calls[0].get("resume_session_id") == "sess-prior"  # resumed
+    assert not (tmp_path / "PROGRESS.md").exists()  # no portable memory authored
+    assert "CURRENT PROGRESS.md" not in harness.calls[0]["prompt"]
 
 
 def test_safe_path_rejects_traversal(tmp_path):

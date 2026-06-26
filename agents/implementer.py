@@ -198,6 +198,7 @@ class Implementer:
         ticket: Ticket,
         feedback: str | None = None,
         progress: str | None = None,
+        progress_enabled: bool = False,
     ) -> str:
         criteria = ticket.acceptance_criteria or []
         ac = "\n".join(f"- {c}" for c in criteria) if criteria else "(none listed)"
@@ -207,20 +208,25 @@ class Implementer:
             scope_rule = _ALLOW_SENSITIVE.format(deny=deny)
         else:
             scope_rule = _DENY_SENSITIVE
-        parts = [
-            _SYSTEM,
-            _PROGRESS_RULE,
+        parts = [_SYSTEM]
+        # The committed-memory contract only applies in PROGRESS mode; in RESUME
+        # mode the prior session carries context and PROGRESS.md is not used.
+        if progress_enabled:
+            parts.append(_PROGRESS_RULE)
+        parts += [
             f"--- TICKET #{ticket.number}: {ticket.title} ---\n{ticket.body}",
             f"Acceptance criteria:\n{ac}",
             f"Scope allowlist (primary paths you may touch): {allow}",
             scope_rule,
         ]
-        # The committed working memory travels on every invocation, so a run with
-        # no resumable session is self-sufficient from prompt + PROGRESS.md + diff.
-        parts.append(
-            "--- CURRENT PROGRESS.md (committed working state) ---\n"
-            + (progress or "(none yet — this is the first turn on this branch)")
-        )
+        # In PROGRESS mode the committed working memory travels on every
+        # invocation, so a run with no resumable session is self-sufficient from
+        # prompt + PROGRESS.md + diff.
+        if progress_enabled:
+            parts.append(
+                "--- CURRENT PROGRESS.md (committed working state) ---\n"
+                + (progress or "(none yet — this is the first turn on this branch)")
+            )
         if feedback:
             parts.append(
                 "--- A REVIEWER REQUESTED CHANGES on your previous attempt ---\n"
@@ -297,18 +303,25 @@ class Implementer:
 
         When ``feedback`` is given, the implementer revises its existing work on
         the same branch to address a reviewer's requested changes rather than
-        starting a fresh implementation. A saved claude session for this worktree
-        is resumed so the agent keeps prior context; the (possibly new) session
-        id is persisted back for the next invocation.
+        starting a fresh implementation.
+
+        Continuity is governed by ``config.progress_memory``: in RESUME mode the
+        prior claude session for this worktree is resumed so the agent keeps
+        context; in PROGRESS mode the run never resumes and instead reads/commits
+        a portable ``PROGRESS.md``, so a cold start on any machine is sufficient.
         """
-        resume = load_session(repo_dir)
+        progress_enabled = self.config.progress_memory
+        # RESUME mode continues the prior session; PROGRESS mode never resumes (it
+        # must not depend on a machine-local transcript) and relies on the
+        # committed PROGRESS.md instead.
+        resume = None if progress_enabled else load_session(repo_dir)
         try:
             self._start_branch(repo_dir, branch)
-            # Read the committed working memory AFTER landing on the branch, so a
-            # cold start with resume=None still gets the full state in its prompt.
-            progress = load_progress(repo_dir)
+            # In PROGRESS mode read the committed memory AFTER landing on the
+            # branch, so a cold start (resume=None) still gets the full state.
+            progress = load_progress(repo_dir) if progress_enabled else None
             result = self.harness.run(
-                self._prompt(ticket, feedback, progress),
+                self._prompt(ticket, feedback, progress, progress_enabled),
                 cwd=repo_dir,
                 resume_session_id=resume,
             )
@@ -321,13 +334,14 @@ class Implementer:
 
         base = self.config.merge.target_branch
         notes = (result.text or "")[:500]
-        # Author/refresh the portable memory and commit it on the branch, so the
-        # full working state travels in git regardless of any resumable session.
-        files_changed = self._files_changed(repo_dir, base)
-        write_progress(
-            repo_dir, self._render_progress(ticket, files_changed, notes, feedback)
-        )
-        self._commit_progress(repo_dir, ticket)
+        if progress_enabled:
+            # Author/refresh the portable memory and commit it on the branch, so
+            # the full working state travels in git, not a machine-local session.
+            files_changed = self._files_changed(repo_dir, base)
+            write_progress(
+                repo_dir, self._render_progress(ticket, files_changed, notes, feedback)
+            )
+            self._commit_progress(repo_dir, ticket)
 
         diff = self._diff(repo_dir, base)
         files_changed = self._files_changed(repo_dir, base)

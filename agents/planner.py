@@ -143,10 +143,12 @@ class Planner:
             else []
         )
 
-        # Seed the first PROGRESS.md from the plan, so the implementer's portable
-        # memory exists from the very first turn (prose only — no command output).
-        plan_text = str(data.get("plan", "")).strip()
-        write_progress(repo_dir, self._seed_progress(ticket, plan_text))
+        # In PROGRESS mode, seed the first PROGRESS.md from the plan so the
+        # implementer's portable memory exists from the first turn (prose only).
+        # In RESUME mode the implementer resumes this planning session instead.
+        if self.config.progress_memory:
+            plan_text = str(data.get("plan", "")).strip()
+            write_progress(repo_dir, self._seed_progress(ticket, plan_text))
 
         return PlanResult(
             estimated_input_tokens=est_in,
