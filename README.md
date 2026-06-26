@@ -115,9 +115,23 @@ stacks.
 ./idle-listener.sh --uninstall                     # cancel a pending reschedule + watch state
 ```
 
-`--watch` keeps polling for new `idle:ready` tickets every `--interval` seconds (default 600).
-A rate limit still parks to cron and resumes the watch when the window resets (watch mode is
+`--watch` keeps polling every `--interval` seconds (default 600). Each pass does **both** halves
+of the loop in one go — it services review feedback on open `idle:listen` PRs *and* works new
+`idle:ready` tickets (reviews first, so requested changes land before new work spends budget). A
+rate limit still parks to cron and resumes the watch when the window resets (watch mode is
 persisted across the cron hop). Without `--watch` it's a single backlog pass.
+
+### Review-watching is part of the normal pass
+
+Every `python idle_loop.py` pass (and so every `--watch` interval) checks open `idle:listen` PRs —
+the ones idle-loop opened — for new **reviews** and revises the branch in place to address them, up
+to `budget.review_iterations` times before handing the PR to a human. No separate command is
+required; `--watch-reviews` remains only as an explicit review-only entrypoint for back-compat.
+
+> **What counts as a review.** This responds to PR **reviews** — a *Request changes*, or a
+> *Comment* review submitted **with a body** (GitHub's review flow, "Files changed" → *Review
+> changes*). It does **not** see plain conversation comments typed in the PR's main comment box
+> (those are issue comments, a different API). Leave feedback as a review for idle-loop to act on it.
 
 Set `IDLE_PYTHON` if `python3` isn't your interpreter. On macOS the cron daemon may need Full
 Disk Access (System Settings → Privacy & Security), and `claude` must be on `PATH` (the listener
@@ -135,6 +149,7 @@ though, is the listener + cron above (a skill only runs inside a session).
 | `--dry-run` | off | List ready issues + their cost band; take **no** action. |
 | `--repo-dir DIR` | `.` | Working directory where the implementer operates on branches. |
 | `--max-tickets N` | unlimited | Process at most N tickets this run. |
+| `--watch-reviews` | off | Review-only pass: address new reviews on open `idle:listen` PRs, then exit. The normal pass already does this, so it's optional. |
 
 ---
 

@@ -998,6 +998,58 @@ def test_main_watch_reviews_flag_calls_watch(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Unified pass: one run() works tickets AND services reviews (#25)
+# --------------------------------------------------------------------------- #
+def test_single_pass_services_reviews_and_works_tickets(tmp_path):
+    # One run() must both work a ready ticket and address an actionable review on
+    # an open idle:listen PR — no separate --watch-reviews invocation.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False
+    )
+    # An open idle:listen PR (for a different issue #2) with a changes-requested
+    # review waiting to be serviced.
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = [_review(100, "CHANGES_REQUESTED", body="address Y")]
+    _seed_watch(orch, 5, issue=2, branch="idle/issue-2", worktree=str(tmp_path))
+
+    records = orch.run()
+
+    # Ticket #1 was worked this pass (a PR opened)...
+    assert [r.ticket_id for r in records] == [1]
+    assert len(gh.prs) == 1
+    # ...and PR #5's review was serviced in the SAME pass (its branch revised).
+    touched = {call[0] for call in implementer.calls}
+    assert touched == {1, 2}
+    assert (str(tmp_path), "idle/issue-2") in implementer.pushed
+
+
+def test_run_drives_watch_reviews_each_pass(tmp_path):
+    # Even with no listen PRs, run() invokes watch_reviews exactly once per pass.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False
+    )
+    calls = {"n": 0}
+    real = orch.watch_reviews
+
+    def spy():
+        calls["n"] += 1
+        return real()
+
+    orch.watch_reviews = spy
+    orch.run()
+    assert calls["n"] == 1
+
+
+def test_dry_run_does_not_service_reviews(tmp_path):
+    # dry-run takes no action — reviews must not be serviced.
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    calls = {"n": 0}
+    orch.watch_reviews = lambda: calls.__setitem__("n", calls["n"] + 1) or []
+    orch.run(dry_run=True)
+    assert calls["n"] == 0
+
+
+# --------------------------------------------------------------------------- #
 # Parked-ticket lifecycle: drop idle:ready, in-progress label, PR reuse (#27)
 # --------------------------------------------------------------------------- #
 def test_park_clears_ready_so_ticket_is_not_rediscovered(tmp_path):
