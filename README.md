@@ -10,8 +10,8 @@ acceptance criteria → merge only if everything passes, otherwise park it for a
 clear reason.**
 
 Its signature, differentiating feature: a **pre-loop cost estimator** that prices each ticket
-*before any tokens are spent*, so work is triaged by ROI — ship the \$30 ticket tonight, flag
-the \$300 ticket for a human first.
+up front — from a cheap, grounded planning pass (or a zero-token heuristic) — so work is triaged
+by ROI: ship the \$30 ticket tonight, flag the \$300 ticket for a human first.
 
 ---
 
@@ -143,8 +143,8 @@ though, is the listener + cron above (a skill only runs inside a session).
 > **Provenance:** the pre-loop, per-ticket cost-estimation gate (`guards/estimate.py`) is this
 > project's original contribution. Please keep this attribution.
 
-Before a single token is spent, the `Estimator` scores each ticket on cheap, explainable
-proxies and prices it:
+idle-loop prices each ticket one of two ways. The **heuristic** `Estimator` spends *zero tokens* —
+it scores each ticket on cheap, explainable proxies and prices it:
 
 - **number of acceptance criteria**,
 - **estimated files/modules touched** (keyword/path match of the ticket text against the repo tree),
@@ -158,6 +158,17 @@ These combine into `estimated_iterations`, then
 The result is rendered honestly as a **band** — `~$30 ± $20` — never false precision. Tickets
 priced above `triage.auto_threshold_usd` are parked for a human *before* the loop runs them,
 with the estimate commented on the issue.
+
+**Deterministic mode (default).** Instead of inferring cost from iteration counts, the loop
+prices a ticket from a real, grounded token budget: a cheap **planning pass** (`agents/planner.py`)
+runs a read-only `claude` session that inspects the actual code and reports the input/output
+tokens the work will take, and `estimated_cost = pricing.cost_for_tokens(...)`. The implementer
+then **resumes that same session**, so the plan carries straight into implementation. This spends
+a small, bounded planning pass up front (so estimation is no longer strictly zero-token); a cheap
+heuristic pre-filter still parks obviously-over-budget tickets without planning, and `--dry-run`
+plus any planning failure fall back to the zero-token heuristic above. Set `planner.enabled: false`
+to always use the heuristic. The issue's cost chip then carries a sibling **tokens** badge —
+tokens spent (from the session's own usage) vs the planning estimate.
 
 **It gets better the more it runs.** Every processed ticket logs its pre-estimate features
 alongside the *actual* cost and iterations (see below). Flip `estimator.use_learned: true` and,

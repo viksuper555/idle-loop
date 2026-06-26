@@ -143,3 +143,47 @@ def test_parse_json_tolerates_trailing_lines(monkeypatch, tmp_path):
     h = ClaudeHarness(Config(repo="o/n"))
     res = h.run("x", cwd=str(tmp_path))
     assert res.text == "ok"
+
+
+def test_run_parses_usage_tokens(monkeypatch, tmp_path):
+    payload = {
+        "type": "result",
+        "is_error": False,
+        "result": "done",
+        "total_cost_usd": 0.42,
+        "num_turns": 3,
+        "session_id": "s1",
+        "usage": {
+            "input_tokens": 1200,
+            "output_tokens": 340,
+            "cache_creation_input_tokens": 50,
+            "cache_read_input_tokens": 9000,
+        },
+    }
+    monkeypatch.setattr(subprocess, "run", _fake_run(0, json.dumps(payload)))
+    res = ClaudeHarness(Config(repo="o/n")).run("x", cwd=str(tmp_path))
+    assert res.input_tokens == 1200 and res.output_tokens == 340
+    assert res.cache_creation_tokens == 50 and res.cache_read_tokens == 9000
+
+
+def test_run_usage_absent_yields_zero_tokens(monkeypatch, tmp_path):
+    payload = {"type": "result", "is_error": False, "result": "ok", "total_cost_usd": 0.1, "num_turns": 1}
+    monkeypatch.setattr(subprocess, "run", _fake_run(0, json.dumps(payload)))
+    res = ClaudeHarness(Config(repo="o/n")).run("x", cwd=str(tmp_path))
+    assert res.input_tokens == 0 and res.output_tokens == 0
+    assert res.cache_creation_tokens == 0 and res.cache_read_tokens == 0
+
+
+def test_run_passes_through_timeout_override(monkeypatch, tmp_path):
+    # timeout_s should override config.harness.timeout_s for this call.
+    captured: dict = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"type": "result", "result": "ok", "num_turns": 1}), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ClaudeHarness(Config(repo="o/n")).run("x", cwd=str(tmp_path), timeout_s=42)
+    assert captured["timeout"] == 42

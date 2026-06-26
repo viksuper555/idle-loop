@@ -69,6 +69,19 @@ def test_run_reads_cost_and_diff_from_harness(monkeypatch, tmp_path):
     assert "idle/issue-1" not in harness.calls[0]["prompt"]  # branch is git-managed, not prompted
 
 
+def test_run_populates_token_counts(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    harness = FakeHarness(
+        HarnessResult(
+            text="done", cost_usd=0.42, num_turns=2, input_tokens=1200, output_tokens=340
+        )
+    )
+    res = Implementer(Config(repo="o/n"), harness=harness).run(
+        ticket(1), str(tmp_path), "idle/issue-1"
+    )
+    assert res.input_tokens == 1200 and res.output_tokens == 340
+
+
 def test_rate_limit_propagates(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "run", fake_git())
     harness = FakeHarness(raises=HarnessRateLimited(reset_at=123.0, reset_human="usage limit"))
@@ -147,6 +160,16 @@ def test_safe_path_rejects_traversal(tmp_path):
     assert str(impl._safe_path(str(tmp_path), "src/x.py")).startswith(str(tmp_path.resolve()))
     with pytest.raises(ValueError):
         impl._safe_path(str(tmp_path), "../escape.py")
+
+
+def test_session_helpers_roundtrip(tmp_path):
+    from agents.implementer import load_session, save_session
+
+    assert load_session(str(tmp_path)) is None
+    save_session(str(tmp_path), "sess-xyz")
+    assert load_session(str(tmp_path)) == "sess-xyz"
+    save_session(str(tmp_path), "")  # empty id is a no-op, keeps prior
+    assert load_session(str(tmp_path)) == "sess-xyz"
 
 
 def test_push_branch(monkeypatch, tmp_path):

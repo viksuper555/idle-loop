@@ -44,6 +44,7 @@ from models import (
     ReviewVerdict,
     RunRecord,
     Ticket,
+    format_tokens,
 )
 
 log = logging.getLogger("idle_loop")
@@ -77,10 +78,12 @@ class Orchestrator:
         guards: Sequence[Guard],
         repo_dir: str = ".",
         logger: logging.Logger | None = None,
+        planner=None,
     ) -> None:
         self.config = config
         self.github = github
         self.estimator = estimator
+        self.planner = planner
         self.implementer = implementer
         self.reviewer = reviewer
         # Post-implementation guards, run in order (fail-closed).
@@ -99,6 +102,7 @@ class Orchestrator:
         """Build an orchestrator with the real production dependencies."""
         # Local import keeps anthropic out of the import path for non-agent uses.
         from agents.implementer import Implementer
+        from agents.planner import Planner
         from agents.reviewer import Reviewer
 
         estimator = Estimator(config)
@@ -106,6 +110,7 @@ class Orchestrator:
             config=config,
             github=GitHubClient(config.repo),
             estimator=estimator,
+            planner=Planner(config),
             implementer=Implementer(config),
             reviewer=Reviewer(config),
             guards=[
@@ -146,6 +151,68 @@ class Orchestrator:
         return None
 
     # ------------------------------------------------------------------ #
+    # Estimation
+    # ------------------------------------------------------------------ #
+    def _resolve_estimate(self, ticket: Ticket, repo_dir: str) -> EstimateResult:
+        """Price a ticket deterministically via the planning pass, or fall back.
+
+        The planner runs a cheap read-only claude session that reports a token
+        budget; cost is ``pricing.cost_for_tokens(...)``. Falls back to the
+        heuristic estimator when planning is disabled/unavailable, when a cheap
+        pre-filter already prices the ticket far over threshold (don't pay for a
+        planning pass to confirm an obvious park), or when a session already
+        exists for this worktree (re-planning would clobber in-flight context).
+        ``HarnessRateLimited`` from the planner propagates to stop the loop.
+        """
+        heuristic = self.estimator.estimate(ticket, self._repo_tree())
+        if not self.config.planner.enabled or self.planner is None:
+            return heuristic
+
+        # Cheap pre-filter: an obviously-over-budget ticket parks on the heuristic
+        # without paying for a planning pass.
+        prefilter = (
+            self.config.triage.auto_threshold_usd
+            * self.config.triage.prefilter_multiplier
+        )
+        if heuristic.estimated_cost > prefilter:
+            self.log.info(
+                "#%s heuristic $%.2f over %gx threshold -> skip planning",
+                ticket.number,
+                heuristic.estimated_cost,
+                self.config.triage.prefilter_multiplier,
+            )
+            return heuristic
+
+        # Resume guard: a saved session means the implementer is mid-flight in this
+        # worktree; re-planning would overwrite it. Reuse the heuristic for the chip.
+        from agents.implementer import load_session
+
+        if load_session(repo_dir) is not None:
+            self.log.info(
+                "#%s session exists -> skip planning, reuse heuristic", ticket.number
+            )
+            return heuristic
+
+        plan = self.planner.plan(ticket, repo_dir)  # HarnessRateLimited propagates
+        if plan is None:
+            self.log.info("#%s planning unparseable -> heuristic fallback", ticket.number)
+            return heuristic
+
+        cost = self.config.pricing.cost_for_tokens(
+            plan.estimated_input_tokens, plan.estimated_output_tokens
+        )
+        return EstimateResult(
+            estimated_cost=round(cost, 2),
+            estimated_iterations=heuristic.estimated_iterations,  # informational only
+            confidence=0.85,  # deterministic source -> high, not certain
+            features=heuristic.features,
+            margin=round(cost * self.config.planner.margin_fraction, 2),
+            estimated_input_tokens=plan.estimated_input_tokens,
+            estimated_output_tokens=plan.estimated_output_tokens,
+            source="planner",
+        )
+
+    # ------------------------------------------------------------------ #
     # Per-ticket processing (SPEC steps 2-9)
     # ------------------------------------------------------------------ #
     def process_ticket(self, ticket: Ticket, repo_dir: str | None = None) -> RunRecord:
@@ -183,20 +250,22 @@ class Orchestrator:
             self._label(ticket, labels.needs_human)
             return self._record(ticket, None, None, Outcome.SKIPPED)
 
-        # (2) Estimate — price before spending tokens.
-        estimate = self.estimator.estimate(ticket, self._repo_tree())
+        # (2) Estimate — a cheap planning pass reports a deterministic token
+        # budget (falls back to the heuristic), so triage acts on a grounded number.
+        estimate = self._resolve_estimate(ticket, repo_dir)
         band = estimate.band()
         self.log.info(
-            "#%s estimate %s (%.1f iters, conf %.2f)",
+            "#%s estimate %s (%s, conf %.2f)",
             ticket.number,
             band,
-            estimate.estimated_iterations,
+            estimate.source,
             estimate.confidence,
         )
         # Surface the price on the issue itself as a chip the moment it's known.
         self._cost_chip(ticket, estimate)
 
-        # (3) Triage — park anything over the auto threshold before any tokens.
+        # (3) Triage — park anything over the auto threshold (after the cheap
+        # planning pass, which is the only spend so far).
         threshold = self.config.triage.auto_threshold_usd
         if estimate.estimated_cost > threshold:
             self.log.info("#%s over threshold $%g -> needs human", ticket.number, threshold)
@@ -221,8 +290,13 @@ class Orchestrator:
             impl.cost_usd,
             " [error]" if impl.error else "",
         )
-        # Iteration done — refresh the chip with the running actual cost.
-        self._cost_chip(ticket, estimate, spent=impl.cost_usd)
+        # Iteration done — refresh the chip with the running actual cost + tokens.
+        self._cost_chip(
+            ticket,
+            estimate,
+            spent=impl.cost_usd,
+            spent_tokens=impl.input_tokens + impl.output_tokens,
+        )
 
         # (5) Guards — fail closed, in order.
         ctx = GuardContext(
@@ -264,6 +338,7 @@ class Orchestrator:
         self.log.info("#%s review: %s", ticket.number, verdict.decision)
 
         total_cost = impl.cost_usd
+        total_tokens = impl.input_tokens + impl.output_tokens
         attempt = 0
         while not verdict.approved and attempt < self.config.budget.review_iterations:
             if total_cost >= self.config.budget.per_ticket_cap_usd:
@@ -285,6 +360,7 @@ class Orchestrator:
                 ticket, repo_dir, branch, feedback=_review_feedback(verdict)
             )
             total_cost += impl.cost_usd
+            total_tokens += impl.input_tokens + impl.output_tokens
             self.log.info(
                 "#%s revised: %d files, %d iters, $%.2f (total $%.2f)%s",
                 ticket.number,
@@ -294,8 +370,10 @@ class Orchestrator:
                 total_cost,
                 " [error]" if impl.error else "",
             )
-            # Iteration done — refresh the chip with the cumulative spend.
-            self._cost_chip(ticket, estimate, spent=total_cost)
+            # Iteration done — refresh the chip with the cumulative spend + tokens.
+            self._cost_chip(
+                ticket, estimate, spent=total_cost, spent_tokens=total_tokens
+            )
 
             # Re-run guards on the revised diff. A failure here (e.g. the revision
             # ballooned past max_diff_lines) parks rather than looping further —
@@ -616,6 +694,7 @@ class Orchestrator:
         ticket: Ticket,
         estimate: EstimateResult,
         spent: float | None = None,
+        spent_tokens: int | None = None,
     ) -> None:
         """Upsert the sticky cost chip on the issue (estimate, then spend so far).
 
@@ -624,7 +703,9 @@ class Orchestrator:
         """
         try:
             self.github.upsert_comment(
-                ticket.number, COST_CHIP_MARKER, _cost_chip_body(estimate, spent)
+                ticket.number,
+                COST_CHIP_MARKER,
+                _cost_chip_body(estimate, spent, spent_tokens),
             )
         except GitHubError as exc:
             self.log.warning("cost chip on #%s failed: %s", ticket.number, exc)
@@ -727,22 +808,48 @@ def _shield_url(label: str, message: str, color: str) -> str:
     return f"https://img.shields.io/badge/{enc(label)}-{enc(message)}-{color}"
 
 
-def _cost_chip_body(estimate: EstimateResult, spent: float | None) -> str:
-    """Render the sticky cost-chip comment body (carries ``COST_CHIP_MARKER``).
+def _cost_chip_body(
+    estimate: EstimateResult, spent: float | None, spent_tokens: int | None = None
+) -> str:
+    """Render the sticky cost-chip body: a cost badge and a sibling tokens badge.
 
-    Before any spend it shows the estimate band; once an iteration completes it
-    shows the running actual cost alongside the original estimate.
+    Before any spend each badge shows its estimate; once an iteration completes
+    they show ``spent / estimate``. The token estimate is the planning pass's
+    budget and reads ``n/a`` when the estimate fell back to the dollar-only
+    heuristic (carries ``COST_CHIP_MARKER``).
     """
     band = estimate.band()
+    est_tokens = estimate.estimated_tokens
+
+    # Cost badge + caption.
     if spent is None:
-        message = f"est {band}"
-        url = _shield_url("idle-loop cost", message, "blue")
-        caption = f"**idle-loop cost estimate:** {band}"
+        cost_url = _shield_url("idle-loop cost", f"est {band}", "blue")
+        cost_caption = f"**idle-loop cost estimate:** {band}"
     else:
-        message = f"${spent:.2f} spent / est {band}"
-        url = _shield_url("idle-loop cost", message, "brightgreen")
-        caption = f"**idle-loop cost so far:** ${spent:.2f} _(estimate {band})_"
-    return f"{COST_CHIP_MARKER}\n![idle-loop cost]({url})\n\n{caption}"
+        cost_url = _shield_url(
+            "idle-loop cost", f"${spent:.2f} spent / est {band}", "brightgreen"
+        )
+        cost_caption = f"**idle-loop cost so far:** ${spent:.2f} _(estimate {band})_"
+
+    # Sibling tokens badge + caption. Spent tokens are always shown once known;
+    # the estimate reads "n/a" when the dollar-only heuristic produced no budget.
+    est_str = format_tokens(est_tokens) if est_tokens > 0 else "n/a"
+    if spent_tokens is None:
+        tok_msg = f"est {est_str}"
+        tok_color = "blue" if est_tokens > 0 else "lightgrey"
+        tok_caption = f"**tokens (est):** {est_str}"
+    else:
+        tok_msg = f"{format_tokens(spent_tokens)} / est {est_str}"
+        tok_color = "brightgreen"
+        tok_caption = f"**tokens:** {format_tokens(spent_tokens)} _(est {est_str})_"
+    tok_url = _shield_url("idle-loop tokens", tok_msg, tok_color)
+
+    return (
+        f"{COST_CHIP_MARKER}\n"
+        f"![idle-loop cost]({cost_url})\n"
+        f"![idle-loop tokens]({tok_url})\n\n"
+        f"{cost_caption} · {tok_caption}"
+    )
 
 
 def _gates_summary(results: list[GuardResult]) -> str:

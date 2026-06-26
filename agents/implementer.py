@@ -25,6 +25,37 @@ from models import ImplementationResult, Ticket
 # which is gitignored.
 _SESSION_FILE = ".idle-loop/session"
 
+
+def session_path(repo_dir: str) -> Path:
+    """Path to the per-worktree claude session file."""
+    return Path(repo_dir) / _SESSION_FILE
+
+
+def load_session(repo_dir: str) -> str | None:
+    """Read the saved claude session id for ``repo_dir`` (None if absent/empty)."""
+    try:
+        sid = session_path(repo_dir).read_text(encoding="utf-8").strip()
+        return sid or None
+    except OSError:
+        return None
+
+
+def save_session(repo_dir: str, session_id: str) -> None:
+    """Persist a claude session id for ``repo_dir`` (best-effort, never fatal).
+
+    The planner seeds this file so the implementer's resume picks up the same
+    session and the plan carries into implementation.
+    """
+    if not session_id:
+        return
+    try:
+        path = session_path(repo_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(session_id, encoding="utf-8")
+    except OSError:
+        pass  # context continuity is best-effort, never fatal
+
+
 _SYSTEM = (
     "You are an autonomous implementer working a single GitHub ticket on an "
     "isolated git branch inside the current working directory. Read the ticket "
@@ -146,28 +177,6 @@ class Implementer:
         return "\n\n".join(parts) + "\n"
 
     # ------------------------------------------------------------------ #
-    # Session persistence (context continuity across invocations)
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _load_session(repo_dir: str) -> str | None:
-        try:
-            sid = (Path(repo_dir) / _SESSION_FILE).read_text(encoding="utf-8").strip()
-            return sid or None
-        except OSError:
-            return None
-
-    @staticmethod
-    def _save_session(repo_dir: str, session_id: str) -> None:
-        if not session_id:
-            return
-        try:
-            path = Path(repo_dir) / _SESSION_FILE
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(session_id, encoding="utf-8")
-        except OSError:
-            pass  # context continuity is best-effort, never fatal
-
-    # ------------------------------------------------------------------ #
     # Entry point
     # ------------------------------------------------------------------ #
     def run(
@@ -185,7 +194,7 @@ class Implementer:
         is resumed so the agent keeps prior context; the (possibly new) session
         id is persisted back for the next invocation.
         """
-        resume = self._load_session(repo_dir)
+        resume = load_session(repo_dir)
         try:
             self._start_branch(repo_dir, branch)
             result = self.harness.run(
@@ -198,7 +207,7 @@ class Implementer:
         except Exception as exc:  # noqa: BLE001 - return a failed result, never raise
             return ImplementationResult(branch=branch, error=str(exc) or type(exc).__name__)
 
-        self._save_session(repo_dir, result.session_id)
+        save_session(repo_dir, result.session_id)
 
         base = self.config.merge.target_branch
         diff = self._diff(repo_dir, base)
@@ -209,10 +218,12 @@ class Implementer:
             files_changed=files_changed,
             iterations=result.num_turns,
             cost_usd=result.cost_usd,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
             notes=(result.text or "")[:500],
             no_progress=False,
             error="harness reported an error" if result.is_error else "",
         )
 
 
-__all__ = ["Implementer"]
+__all__ = ["Implementer", "session_path", "load_session", "save_session"]

@@ -25,6 +25,9 @@ class Labels:
 @dataclass
 class Triage:
     auto_threshold_usd: float = 50.0
+    # Heuristic pre-filter: skip the (token-spending) planning pass on tickets the
+    # cheap heuristic already prices above auto_threshold_usd * this multiplier.
+    prefilter_multiplier: float = 2.0
 
 
 @dataclass
@@ -71,11 +74,32 @@ class Pricing:
     # Fallback prior for estimated_cost when the cost log has no data yet.
     default_cost_per_iteration_usd: float = 2.0
 
+    def cost_for_tokens(self, input_tokens: float, output_tokens: float) -> float:
+        """USD for a token budget at the configured per-MTok rates."""
+        return (
+            input_tokens / 1_000_000.0 * self.input_per_mtok
+            + output_tokens / 1_000_000.0 * self.output_per_mtok
+        )
+
 
 @dataclass
 class Estimator:
     use_learned: bool = False  # toggle the v2 regression once enough rows exist
     min_rows_for_learned: int = 20
+
+
+@dataclass
+class Planner:
+    """The deterministic planning pass that prices a ticket via a real claude
+    session (a token budget), replacing the iteration-based heuristic.
+
+    Disabling it falls back to the heuristic estimator everywhere.
+    """
+
+    enabled: bool = True
+    model: str | None = None  # None -> inherit Config.model
+    timeout_s: int = 600  # planning is short; don't inherit the implementer's wall
+    margin_fraction: float = 0.25  # band width as a fraction of the deterministic cost
 
 
 @dataclass
@@ -111,6 +135,7 @@ class Config:
     merge: Merge = field(default_factory=Merge)
     pricing: Pricing = field(default_factory=Pricing)
     estimator: Estimator = field(default_factory=Estimator)
+    planner: Planner = field(default_factory=Planner)
     harness: Harness = field(default_factory=Harness)
 
     def validate(self) -> None:
@@ -163,6 +188,8 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> Config:
         cfg.pricing = _build(Pricing, raw["pricing"])
     if isinstance(raw.get("estimator"), dict):
         cfg.estimator = _build(Estimator, raw["estimator"])
+    if isinstance(raw.get("planner"), dict):
+        cfg.planner = _build(Planner, raw["planner"])
     if isinstance(raw.get("harness"), dict):
         cfg.harness = _build(Harness, raw["harness"])
 

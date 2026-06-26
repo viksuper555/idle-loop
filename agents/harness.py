@@ -56,6 +56,10 @@ class HarnessResult:
     text: str = ""  # final assistant message
     cost_usd: float = 0.0  # total_cost_usd reported by Claude Code
     num_turns: int = 0
+    input_tokens: int = 0  # from raw["usage"]; non-cache input tokens
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
     is_error: bool = False
     session_id: str = ""
     returncode: int = 0
@@ -181,6 +185,24 @@ class ClaudeHarness:
         cmd += list(self.config.harness.extra_args)
         return cmd
 
+    @staticmethod
+    def _usage(raw: dict | None) -> dict[str, int]:
+        """Token counts from a result object's ``usage`` block (all 0 if absent)."""
+        usage = (raw or {}).get("usage") or {}
+
+        def _int(key: str) -> int:
+            try:
+                return int(usage.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "input_tokens": _int("input_tokens"),
+            "output_tokens": _int("output_tokens"),
+            "cache_creation_tokens": _int("cache_creation_input_tokens"),
+            "cache_read_tokens": _int("cache_read_input_tokens"),
+        }
+
     def run(
         self,
         prompt: str,
@@ -191,6 +213,7 @@ class ClaudeHarness:
         disallowed_tools: list[str] | None = None,
         model: str | None = None,
         resume_session_id: str | None = None,
+        timeout_s: int | None = None,
     ) -> HarnessResult:
         """Invoke ``claude -p`` in ``cwd``; raise :class:`HarnessRateLimited` on a limit.
 
@@ -202,6 +225,9 @@ class ClaudeHarness:
             skip_permissions = self.config.harness.skip_permissions
         if model is None:
             model = self.config.model
+        effective_timeout = (
+            timeout_s if timeout_s is not None else self.config.harness.timeout_s
+        )
 
         cmd = self._build_cmd(
             prompt,
@@ -219,7 +245,7 @@ class ClaudeHarness:
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=self.config.harness.timeout_s,
+                timeout=effective_timeout,
             )
         except FileNotFoundError as exc:
             raise HarnessError(
@@ -227,7 +253,7 @@ class ClaudeHarness:
                 "or set harness.claude_bin"
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise HarnessError(f"claude timed out after {self.config.harness.timeout_s}s") from exc
+            raise HarnessError(f"claude timed out after {effective_timeout}s") from exc
 
         stdout = proc.stdout or ""
         stderr = proc.stderr or ""
@@ -252,6 +278,7 @@ class ClaudeHarness:
             text=text,
             cost_usd=float(raw.get("total_cost_usd", 0.0) or 0.0) if raw else 0.0,
             num_turns=int(raw.get("num_turns", 0) or 0) if raw else 0,
+            **self._usage(raw),
             is_error=is_error,
             session_id=str(raw.get("session_id", "")) if raw else "",
             returncode=proc.returncode,
