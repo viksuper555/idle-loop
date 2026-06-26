@@ -47,9 +47,15 @@ class FakeGitHub:
         self.labelled_prs: dict[str, list[dict]] = {}  # label -> [{number, title}]
         self.reviews: dict[int, list[dict]] = {}  # pr number -> [review dicts]
         self.pr_details: dict[int, dict] = {}  # pr number -> get_pull_request payload
+        # Open PRs keyed by head branch, for find_open_pr_by_head (the reuse path).
+        self.open_pr_by_head: dict[str, dict] = {}
 
     def list_ready_issues(self, label: str) -> list[Ticket]:
-        return list(self.issues)
+        # Mirror GitHubClient: the issues endpoint filters to the requested label.
+        return [t for t in self.issues if label in t.labels]
+
+    def find_open_pr_by_head(self, branch: str) -> dict | None:
+        return self.open_pr_by_head.get(branch)
 
     def get_issue(self, number: int) -> Ticket:
         for t in self.issues:
@@ -254,7 +260,13 @@ def test_run_ensures_idle_labels_before_processing(tmp_path):
     )
     orch.run()
     assert gh.ensured == [
-        ["idle:ready", "idle:needs-human", "idle:allow-sensitive", "idle:listen"]
+        [
+            "idle:ready",
+            "idle:needs-human",
+            "idle:allow-sensitive",
+            "idle:listen",
+            "idle:in-progress",
+        ]
     ]
 
 
@@ -551,6 +563,7 @@ def test_ensure_labels_syncs_without_running_loop(monkeypatch):
         "idle:needs-human",
         "idle:allow-sensitive",
         "idle:listen",
+        "idle:in-progress",
     ]
 
 
@@ -927,3 +940,86 @@ def test_main_watch_reviews_flag_calls_watch(tmp_path, monkeypatch):
     rc = idle_loop.main(["--watch-reviews", "--repo-dir", str(tmp_path)])
     assert rc == idle_loop.EXIT_OK
     assert called.get("watched") is True
+
+
+# --------------------------------------------------------------------------- #
+# Parked-ticket lifecycle: drop idle:ready, in-progress label, PR reuse (#27)
+# --------------------------------------------------------------------------- #
+def test_park_clears_ready_so_ticket_is_not_rediscovered(tmp_path):
+    # Parking must drop idle:ready, else the ticket is re-worked every pass.
+    guards = [FakeGuard("scope", False, "touches 99 files > max 15")]
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], guards=guards, require_human=False
+    )
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.PARKED
+    assert (1, "idle:needs-human") in gh.added_labels
+    assert (1, "idle:ready") in gh.removed_labels  # no longer "ready"
+
+
+def test_skip_without_criteria_clears_ready(tmp_path):
+    # The no-acceptance-criteria skip is a park site too — it must clear ready.
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1, criteria=[])])
+    orch.process_ticket(ticket(1, criteria=[]))
+    assert (1, "idle:ready") in gh.removed_labels
+
+
+def test_over_threshold_skip_clears_ready(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], threshold=1.0
+    )
+    orch.process_ticket(ticket(1))
+    assert (1, "idle:ready") in gh.removed_labels
+
+
+def test_discover_skips_needs_human_and_in_progress(tmp_path):
+    ready = ticket(1)  # idle:ready only -> discovered
+    parked = ticket(2)
+    parked.labels = ["idle:ready", "idle:needs-human"]  # handed to a human
+    in_prog = ticket(3)
+    in_prog.labels = ["idle:ready", "idle:in-progress"]  # has an open idle-loop PR
+    orch, gh, _, _ = make_orch(tmp_path, issues=[ready, parked, in_prog])
+
+    discovered = orch.discover()
+
+    assert [t.number for t in discovered] == [1]
+
+
+def test_open_pr_marks_issue_in_progress(tmp_path):
+    # Opening a PR labels the *issue* idle:in-progress so a later pass skips it.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=True
+    )
+    orch.process_ticket(ticket(1))
+    assert (1, "idle:in-progress") in gh.added_labels
+
+
+def test_open_pr_reuses_existing_pr_instead_of_creating_duplicate(tmp_path):
+    # A branch that already has an open PR must reuse it — never create a second
+    # one (which GitHub 422s) and never park for "could not open PR".
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False
+    )
+    gh.open_pr_by_head["feature/issue-1"] = {
+        "number": 99,
+        "html_url": "https://gh/pr/99",
+    }
+    rec = orch.process_ticket(ticket(1))
+
+    assert rec.outcome == Outcome.MERGED
+    assert gh.prs == []  # no duplicate PR created
+    assert gh.merged == [99]  # the existing PR was the one acted on
+    assert implementer.pushed[0][1] == "feature/issue-1"  # branch still pushed
+
+
+def test_reap_clears_in_progress_on_finished_pr(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[])
+    root = tmp_path / ".idle-worktrees"
+    (root / "issue-1").mkdir(parents=True)
+    gh.pr_status_for_branch = lambda branch: "done"
+    orch._remove_worktree = lambda p: None
+
+    orch._reap_worktrees()
+
+    # The finished PR's issue (#1, from branch idle/issue-1) gets in-progress cleared.
+    assert (1, "idle:in-progress") in gh.removed_labels

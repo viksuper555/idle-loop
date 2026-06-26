@@ -135,8 +135,22 @@ class Orchestrator:
     # Discovery
     # ------------------------------------------------------------------ #
     def discover(self) -> list[Ticket]:
-        """Fetch open ``idle:ready`` issues, oldest first."""
-        return self.github.list_ready_issues(self.config.labels.ready)
+        """Fetch open ``idle:ready`` issues, oldest first.
+
+        Skips tickets handed to a human (``needs-human``) or already carrying an
+        open idle-loop PR (``in-progress``), so neither is re-discovered and
+        re-worked on a later pass (re-spending budget, risking a duplicate PR).
+        ``needs-human`` is dropped by a human; ``in-progress`` is cleared when the
+        PR merges/closes (see :meth:`_reap_worktrees`). Parking also drops
+        ``idle:ready`` itself (see :meth:`_flag_needs_human`) — this is the belt
+        to that braces.
+        """
+        labels = self.config.labels
+        return [
+            t
+            for t in self.github.list_ready_issues(labels.ready)
+            if not (t.has_label(labels.needs_human) or t.has_label(labels.in_progress))
+        ]
 
     def _repo_tree(self) -> list[str] | None:
         """Best-effort list of tracked files in ``repo_dir`` (for the estimator)."""
@@ -252,8 +266,6 @@ class Orchestrator:
     def _process_ticket(
         self, ticket: Ticket, repo_dir: str, branch: str | None = None
     ) -> RunRecord:
-        labels = self.config.labels
-
         # (1) Reject tickets without acceptance criteria — never guess (SPEC §4).
         if not ticket.acceptance_criteria:
             self.log.info("#%s rejected: no acceptance criteria", ticket.number)
@@ -263,7 +275,7 @@ class Orchestrator:
                 "Add an `## Acceptance Criteria` checklist so the loop can verify "
                 "the change against concrete, testable conditions.",
             )
-            self._label(ticket, labels.needs_human)
+            self._flag_needs_human(ticket)
             return self._record(ticket, None, None, Outcome.SKIPPED)
 
         # (2) Estimate — a cheap planning pass reports a deterministic token
@@ -291,7 +303,7 @@ class Orchestrator:
                 "auto-run threshold, so parking for a human to triage.\n\n"
                 + _estimate_detail(estimate),
             )
-            self._label(ticket, labels.needs_human)
+            self._flag_needs_human(ticket)
             return self._record(ticket, estimate, None, Outcome.SKIPPED)
 
         # (4) Implement on a fresh isolated branch (named <prefix>/issue-<id>).
@@ -347,6 +359,10 @@ class Orchestrator:
             )
             return self._record(ticket, estimate, impl, Outcome.PARKED)
 
+        # The issue now has an open idle-loop PR — mark it in-progress so a later
+        # pass skips it (discover()) instead of re-implementing from scratch.
+        # Cleared when the PR merges/closes (see _reap_worktrees).
+        self._flag_in_progress(ticket)
         # Mark the fresh PR idle:listen and remember the worktree + session it was
         # built in, so a later review can resume that same claude context.
         self._listen_pr(ticket, pr, branch, repo_dir)
@@ -453,7 +469,7 @@ class Orchestrator:
 
         # Park: either review requested changes, or human approval is required.
         self.log.info("#%s parked for human", ticket.number)
-        self._label(ticket, self.config.labels.needs_human)
+        self._flag_needs_human(ticket)
         self._comment(ticket, _park_message(verdict, pr, self.config.merge.require_human))
         return self._record(ticket, estimate, impl, Outcome.PARKED)
 
@@ -670,6 +686,11 @@ class Orchestrator:
             if status == "done":
                 self.log.info("%s PR merged/closed — reclaiming worktree", branch)
                 self._remove_worktree(os.path.join(root, name))
+                # The PR is finished — clear idle:in-progress on its issue so the
+                # ticket can flow normally again (e.g. reopened, or follow-up work).
+                issue = naming.issue_number_from_branch(branch)
+                if issue is not None:
+                    self._unlabel_num(issue, self.config.labels.in_progress)
 
     def _on_rate_limit(self, exc: HarnessRateLimited) -> None:
         """Persist the reset time and emit a marker the bash listener parses."""
@@ -706,7 +727,13 @@ class Orchestrator:
         labels = self.config.labels
         try:
             self.github.ensure_labels(
-                [labels.ready, labels.needs_human, labels.allow_sensitive, labels.listen]
+                [
+                    labels.ready,
+                    labels.needs_human,
+                    labels.allow_sensitive,
+                    labels.listen,
+                    labels.in_progress,
+                ]
             )
         except GitHubError as exc:
             self.log.warning("ensure_labels failed (continuing): %s", exc)
@@ -734,10 +761,38 @@ class Orchestrator:
         except GitHubError as exc:
             self.log.warning("comment on #%s failed: %s", number, exc)
 
-    def _park(self, ticket: Ticket, reason: str) -> None:
-        """Comment a crisp reason and flag the ticket for a human."""
-        self._comment(ticket, f"🅿️ **idle-loop parked this ticket.**\n\n{reason}")
+    def _unlabel(self, ticket: Ticket, label: str) -> None:
+        self._unlabel_num(ticket.number, label)
+
+    def _unlabel_num(self, number: int, label: str) -> None:
+        """Remove ``label`` from issue/PR ``number`` (a missing label is fine)."""
+        try:
+            self.github.remove_label(number, label)
+        except GitHubError as exc:
+            self.log.warning("remove_label %s on #%s failed: %s", label, number, exc)
+
+    def _flag_needs_human(self, ticket: Ticket) -> None:
+        """Hand a ticket back to a human: add ``needs-human``, drop ``idle:ready``.
+
+        Dropping ``idle:ready`` is what stops a parked ticket from being
+        re-discovered (and re-worked, re-spending budget) on the next pass — the
+        single place every park/skip/defer site routes through.
+        """
         self._label(ticket, self.config.labels.needs_human)
+        self._unlabel(ticket, self.config.labels.ready)
+
+    def _flag_in_progress(self, ticket: Ticket) -> None:
+        """Mark a ticket as having an open idle-loop PR so discover() skips it."""
+        self._label(ticket, self.config.labels.in_progress)
+
+    def _park(self, ticket: Ticket, reason: str) -> None:
+        """Comment a crisp reason and flag the ticket for a human.
+
+        Routes through :meth:`_flag_needs_human`, so parking also drops
+        ``idle:ready`` and the ticket is not re-discovered on the next pass.
+        """
+        self._comment(ticket, f"🅿️ **idle-loop parked this ticket.**\n\n{reason}")
+        self._flag_needs_human(ticket)
 
     def _cost_chip(
         self,
@@ -774,6 +829,24 @@ class Orchestrator:
         if not self.implementer.push_branch(repo_dir or self.repo_dir, branch):
             self.log.warning("#%s push of branch %s failed", ticket.number, branch)
             return None
+        # Reuse an open PR for this branch if one already exists — the push above
+        # has updated it in place. Creating a second PR for the same head would
+        # 422 ("A pull request already exists") and wrongly park the ticket.
+        try:
+            existing = self.github.find_open_pr_by_head(branch)
+        except GitHubError as exc:
+            self.log.warning(
+                "#%s lookup of open PR for %s failed: %s", ticket.number, branch, exc
+            )
+            existing = None
+        if existing is not None:
+            self.log.info(
+                "#%s reusing open PR #%s on %s",
+                ticket.number,
+                existing.get("number"),
+                branch,
+            )
+            return existing
         body = pr_template.render_pr_body(self._pr_content(ticket, branch, impl, results, estimate))
         try:
             pr = self.github.create_pull_request(
@@ -1308,7 +1381,13 @@ def ensure_labels(config: Config) -> list[str]:
     CI — the only loop side effect that's static and safe to run unattended.
     """
     labels = config.labels
-    names = [labels.ready, labels.needs_human, labels.allow_sensitive, labels.listen]
+    names = [
+        labels.ready,
+        labels.needs_human,
+        labels.allow_sensitive,
+        labels.listen,
+        labels.in_progress,
+    ]
     GitHubClient(config.repo).ensure_labels(names)
     log.info("ensured labels on %s: %s", config.repo, ", ".join(names))
     return names

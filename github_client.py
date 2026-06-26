@@ -239,6 +239,23 @@ class GitHubClient:
             if "pull_request" in item
         ]
 
+    def find_open_pr_by_head(self, branch: str) -> dict | None:
+        """Return the open PR for head ``branch`` as ``{"number", "html_url"}``.
+
+        ``None`` when no open PR exists for the branch. Used to reuse an existing
+        PR on a re-pushed branch instead of POSTing a duplicate — GitHub rejects
+        the second create with 422 "A pull request already exists".
+        """
+        owner = self.repo.split("/", 1)[0]
+        resp = self._request(
+            "GET",
+            f"/repos/{self.repo}/pulls",
+            params={"head": f"{owner}:{branch}", "state": "open"},
+        )
+        for pr in resp.json():
+            return {"number": int(pr["number"]), "html_url": pr.get("html_url", "")}
+        return None
+
     def get_pull_request(self, number: int) -> dict:
         """Fetch a PR as ``{"number", "head_branch", "state", "html_url"}``."""
         data = self._request("GET", f"/repos/{self.repo}/pulls/{number}").json()
