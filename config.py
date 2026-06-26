@@ -24,6 +24,10 @@ class Labels:
     # for new reviews while it carries this label, and drops it once the PR is
     # deferred to a human (see Orchestrator.watch_reviews).
     listen: str = "idle:listen"
+    # Applied to an issue the moment idle-loop opens a PR for it; discover() skips
+    # tickets carrying it so a ticket with an open idle-loop PR is not re-worked
+    # from scratch. Cleared when the PR merges/closes (see _reap_worktrees).
+    in_progress: str = "idle:in-progress"
 
 
 @dataclass

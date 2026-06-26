@@ -7,6 +7,8 @@ labels:
   ready: "idle:ready"
   needs_human: "idle:needs-human"
   allow_sensitive: "idle:allow-sensitive"
+  listen: "idle:listen"
+  in_progress: "idle:in-progress"
 
 triage:
   auto_threshold_usd: 50          # above this, park for a human pre-run

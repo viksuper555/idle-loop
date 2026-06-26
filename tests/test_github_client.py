@@ -432,6 +432,24 @@ def test_list_pull_requests_by_label_filters_to_prs(monkeypatch):
     assert call["params"] == {"state": "open", "labels": "idle:listen", "per_page": 100}
 
 
+def test_find_open_pr_by_head_returns_first_open(monkeypatch):
+    client, session = make_client(
+        monkeypatch,
+        [FakeResponse(200, [{"number": 21, "html_url": "https://gh/pr/21"}])],
+    )
+    out = client.find_open_pr_by_head("idle/issue-3")
+    assert out == {"number": 21, "html_url": "https://gh/pr/21"}
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "https://api.github.com/repos/owner/name/pulls"
+    assert call["params"] == {"head": "owner:idle/issue-3", "state": "open"}
+
+
+def test_find_open_pr_by_head_none_when_no_pr(monkeypatch):
+    client, _ = make_client(monkeypatch, [FakeResponse(200, [])])
+    assert client.find_open_pr_by_head("idle/issue-3") is None
+
+
 def test_get_pull_request_parses_head_branch(monkeypatch):
     client, session = make_client(
         monkeypatch,
