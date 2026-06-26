@@ -36,3 +36,12 @@ pricing:                          # USD per 1M tokens (claude-opus-4-8)
 estimator:
   use_learned: false              # v2 regression; flip on once enough rows exist
   min_rows_for_learned: 20
+
+harness:                          # agents run via the Claude Code CLI (no API key)
+  backend: "claude_code"
+  claude_bin: "claude"            # binary name or absolute path
+  skip_permissions: true          # --dangerously-skip-permissions (unattended runs)
+  output_format: "json"
+  timeout_s: 3600                 # hard wall-clock per claude invocation
+  rate_limit_window_hours: 5.0    # fallback reset window if the notice can't be parsed
+  extra_args: []                  # any extra flags to pass to `claude`
