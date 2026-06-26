@@ -334,3 +334,26 @@ def test_default_branch(monkeypatch):
     client, session = make_client(monkeypatch, [FakeResponse(200, {"default_branch": "trunk"})])
     assert client.default_branch() == "trunk"
     assert session.calls[0]["url"] == "https://api.github.com/repos/owner/name"
+
+
+def test_pr_status_for_branch_open(monkeypatch):
+    client, session = make_client(
+        monkeypatch, [FakeResponse(200, [{"number": 9, "state": "open"}])]
+    )
+    assert client.pr_status_for_branch("idle/issue-3") == "open"
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "https://api.github.com/repos/owner/name/pulls"
+    assert call["params"] == {"head": "owner:idle/issue-3", "state": "all"}
+
+
+def test_pr_status_for_branch_done(monkeypatch):
+    client, _ = make_client(
+        monkeypatch, [FakeResponse(200, [{"number": 9, "state": "closed"}])]
+    )
+    assert client.pr_status_for_branch("idle/issue-3") == "done"
+
+
+def test_pr_status_for_branch_none(monkeypatch):
+    client, _ = make_client(monkeypatch, [FakeResponse(200, [])])
+    assert client.pr_status_for_branch("idle/issue-3") == "none"
