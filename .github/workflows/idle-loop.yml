@@ -1,16 +1,23 @@
 # idle-loop — agentic CI/CD.
 #
-# Two triggers:
-#   * workflow_dispatch — run it by hand from the Actions tab, choosing whether
-#     to act for real and how many tickets to take.
-#   * schedule — a nightly pass that DEFAULTS TO --dry-run for safety, so an
-#     unattended run never merges anything on its own.
+# The agents run through the Claude Code harness (the `claude` CLI), which is
+# authenticated by a Claude login — NOT an API key. That login isn't available
+# in a default GitHub Actions runner, so:
+#   * schedule — a nightly **dry-run** (estimator + GitHub only; never invokes
+#     the harness), so it's a safe, auth-free "what would the loop cost tonight?"
+#     report.
+#   * workflow_dispatch — manual; a real (non-dry-run) pass needs Claude Code
+#     installed AND authenticated on the runner (e.g. a self-hosted runner that
+#     has run `claude` /login, or a CLAUDE_CODE_OAUTH_TOKEN your setup injects).
 #
-# Secrets required (repo or org level):
-#   ANTHROPIC_API_KEY  — the coding/review agents
-#   GH_TOKEN           — issues/PRs/labels/merges (a PAT, or pass the built-in
-#                        GITHUB_TOKEN; note the built-in token cannot trigger
-#                        further workflows on the PRs it opens).
+# For real unattended runs, the intended path is the LOCAL listener + cron
+# (./idle-listener.sh), which uses your existing Claude login and reschedules
+# itself across rate limits. See the README.
+#
+# Secret used here:
+#   GH_TOKEN — issues/PRs/labels/merges (a PAT, or the built-in GITHUB_TOKEN;
+#              note the built-in token cannot trigger further workflows on the
+#              PRs it opens).
 name: idle-loop
 
 on:
@@ -57,7 +64,6 @@ jobs:
 
       - name: Run idle-loop
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
         run: |
           set -euo pipefail
@@ -68,6 +74,13 @@ jobs:
             DRY=""
           else
             DRY="--dry-run"
+          fi
+
+          if [ -z "$DRY" ] && ! command -v claude >/dev/null; then
+            echo "::error::A real run needs the Claude Code harness (claude) installed and"
+            echo "::error::authenticated on this runner. Use --dry-run here, or run the local"
+            echo "::error::listener (./idle-listener.sh). See the README."
+            exit 1
           fi
 
           MAX=""
