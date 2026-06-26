@@ -33,7 +33,7 @@ from config import Config, load_config
 from costlog import append_record
 from github_client import GitHubClient, GitHubError
 from guards.base import Guard, GuardContext, run_all
-from guards.budget import BudgetGuard
+from guards.budget import BudgetGuard, effective_caps
 from guards.estimate import Estimator
 from guards.scope import ScopeGuard
 from guards.security import SecurityGuard
@@ -135,22 +135,37 @@ class Orchestrator:
     # Discovery
     # ------------------------------------------------------------------ #
     def discover(self) -> list[Ticket]:
-        """Fetch open ``idle:ready`` issues, oldest first.
+        """Fetch open tickets to work this pass, oldest first.
+
+        Starts from open ``idle:ready`` issues, then folds in any open issue
+        carrying the ``allow_budget`` override so a ticket previously parked on a
+        budget limit is re-dispatched to continue (its branch/worktree resumes,
+        and the elevated caps stop it re-parking at the same wall).
 
         Skips tickets handed to a human (``needs-human``) or already carrying an
-        open idle-loop PR (``in-progress``), so neither is re-discovered and
-        re-worked on a later pass (re-spending budget, risking a duplicate PR).
-        ``needs-human`` is dropped by a human; ``in-progress`` is cleared when the
-        PR merges/closes (see :meth:`_reap_worktrees`). Parking also drops
-        ``idle:ready`` itself (see :meth:`_flag_needs_human`) — this is the belt
-        to that braces.
+        open idle-loop PR (``in-progress``) — except that the ``allow_budget``
+        override waives the ``needs-human`` skip, since that is exactly the park
+        the human is choosing to override. ``needs-human`` is otherwise dropped by
+        a human; ``in-progress`` is cleared when the PR merges/closes (see
+        :meth:`_reap_worktrees`). Parking also drops ``idle:ready`` itself (see
+        :meth:`_flag_needs_human`).
         """
         labels = self.config.labels
-        return [
-            t
-            for t in self.github.list_ready_issues(labels.ready)
-            if not (t.has_label(labels.needs_human) or t.has_label(labels.in_progress))
-        ]
+        by_number: dict[int, Ticket] = {}
+        for t in self.github.list_ready_issues(labels.ready):
+            by_number[t.number] = t
+        for t in self.github.list_ready_issues(labels.allow_budget):
+            by_number.setdefault(t.number, t)
+
+        out: list[Ticket] = []
+        for t in sorted(by_number.values(), key=lambda t: t.number):
+            if t.has_label(labels.in_progress):
+                continue
+            override = t.has_label(labels.allow_budget)
+            if t.has_label(labels.needs_human) and not override:
+                continue
+            out.append(t)
+        return out
 
     def _repo_tree(self) -> list[str] | None:
         """Best-effort list of tracked files in ``repo_dir`` (for the estimator)."""
@@ -374,15 +389,18 @@ class Orchestrator:
         verdict = self.reviewer.review(ticket, impl.diff)
         self.log.info("#%s review: %s", ticket.number, verdict.decision)
 
+        # The per-ticket cap that bounds the revision loop is raised when the
+        # ticket carries the budget override (matches the guard's caps).
+        _, per_ticket_cap_usd = effective_caps(self.config, ticket)
         total_cost = impl.cost_usd
         total_tokens = impl.input_tokens + impl.output_tokens
         attempt = 0
         while not verdict.approved and attempt < self.config.budget.review_iterations:
-            if total_cost >= self.config.budget.per_ticket_cap_usd:
+            if total_cost >= per_ticket_cap_usd:
                 self.log.info(
                     "#%s per-ticket cap $%.2f reached before revision; parking",
                     ticket.number,
-                    self.config.budget.per_ticket_cap_usd,
+                    per_ticket_cap_usd,
                 )
                 break
             attempt += 1
@@ -770,6 +788,7 @@ class Orchestrator:
                     labels.allow_sensitive,
                     labels.listen,
                     labels.in_progress,
+                    labels.allow_budget,
                 ]
             )
         except GitHubError as exc:
@@ -1424,6 +1443,7 @@ def ensure_labels(config: Config) -> list[str]:
         labels.allow_sensitive,
         labels.listen,
         labels.in_progress,
+        labels.allow_budget,
     ]
     GitHubClient(config.repo).ensure_labels(names)
     log.info("ensured labels on %s: %s", config.repo, ", ".join(names))

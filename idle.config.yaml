@@ -9,6 +9,7 @@ labels:
   allow_sensitive: "idle:allow-sensitive"
   listen: "idle:listen"
   in_progress: "idle:in-progress"
+  allow_budget: "idle:allow-budget"   # raise this ticket's caps to the override ceilings
 
 triage:
   auto_threshold_usd: 50          # above this, park for a human pre-run
@@ -19,6 +20,8 @@ budget:
   max_iterations: 20              # per ticket
   per_ticket_cap_usd: 40
   global_cap_usd: 200             # stop the whole loop here
+  override_max_iterations: 40     # elevated ceiling for an idle:allow-budget ticket
+  override_per_ticket_cap_usd: 80 # elevated $ ceiling for an idle:allow-budget ticket
   no_progress_limit: 3            # same error / empty diff N times -> bail
   review_iterations: 2            # send reviewer feedback back to the implementer
                                   # on the same branch N times before parking
