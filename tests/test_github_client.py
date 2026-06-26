@@ -309,7 +309,23 @@ def test_create_pull_request(monkeypatch):
     call = session.calls[0]
     assert call["method"] == "POST"
     assert call["url"] == "https://api.github.com/repos/owner/name/pulls"
-    assert call["json"] == {"title": "title", "head": "feat", "base": "main", "body": "body"}
+    assert call["json"] == {
+        "title": "title",
+        "head": "feat",
+        "base": "main",
+        "body": "body",
+        "draft": False,
+    }
+
+
+def test_create_pull_request_draft(monkeypatch):
+    client, session = make_client(
+        monkeypatch,
+        [FakeResponse(201, {"number": 7, "html_url": "https://gh/pr/7"})],
+    )
+    out = client.create_pull_request("t", "feat", "main", "b", draft=True)
+    assert out == {"number": 7, "html_url": "https://gh/pr/7"}
+    assert session.calls[0]["json"]["draft"] is True
 
 
 def test_checks_passing_no_checks_is_true(monkeypatch):

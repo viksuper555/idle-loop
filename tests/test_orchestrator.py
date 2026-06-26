@@ -92,10 +92,14 @@ class FakeGitHub:
     def ensure_labels(self, names: list[str]) -> None:
         self.ensured.append(list(names))
 
-    def create_pull_request(self, title: str, head: str, base: str, body: str) -> dict:
+    def create_pull_request(
+        self, title: str, head: str, base: str, body: str, draft: bool = False
+    ) -> dict:
         self._pr_seq += 1
         pr = {"number": self._pr_seq, "html_url": f"https://gh/pr/{self._pr_seq}"}
-        self.prs.append({**pr, "title": title, "head": head, "base": base, "body": body})
+        self.prs.append(
+            {**pr, "title": title, "head": head, "base": base, "body": body, "draft": draft}
+        )
         return pr
 
     def merge_pull_request(self, number: int, method: str = "squash") -> bool:
@@ -305,18 +309,23 @@ def test_happy_path_merges_when_approved_and_no_human_required(tmp_path):
     assert rec.actual_cost == 10.0 and rec.actual_iterations == 3
 
 
-def test_guard_failure_parks_without_pr_or_merge(tmp_path):
-    guards = [FakeGuard("scope", False, "touches 99 files > max 15")]
+def test_posthoc_guard_failure_opens_draft_pr_not_stranded(tmp_path):
+    # A post-implementation guard failure on committed work must open a DRAFT PR
+    # (work + reason, needs-human), never park with the work stranded locally.
+    guards = [FakeGuard("tests", False, "pytest failed: 2 failures")]
     orch, gh, implementer, reviewer = make_orch(
         tmp_path, issues=[ticket(1)], guards=guards, require_human=False
     )
     rec = orch.process_ticket(ticket(1))
     assert rec.outcome == Outcome.PARKED
-    assert gh.prs == []  # guards run before PR; nothing opened
+    assert implementer.calls  # the work WAS done (spent) ...
+    assert len(gh.prs) == 1  # ... so a PR exists — not stranded
+    assert gh.prs[0]["draft"] is True  # opened as a draft (blocked)
+    assert implementer.pushed[0][1] == "feature/issue-1"  # branch pushed
     assert gh.merged == []
     assert reviewer.calls == []  # never reached review
     assert (1, "idle:needs-human") in gh.added_labels
-    assert any("scope" in body for _, body in gh.comments)
+    assert any("tests" in body for _, body in gh.comments)
 
 
 def test_reviewer_request_changes_parks_open_pr(tmp_path):
@@ -637,11 +646,12 @@ def test_dry_run_posts_no_cost_chip(tmp_path):
 # --------------------------------------------------------------------------- #
 # Deterministic planner-based estimate
 # --------------------------------------------------------------------------- #
-def _plan(ein=1_000_000, eout=200_000) -> PlanResult:
+def _plan(ein=1_000_000, eout=200_000, files=None) -> PlanResult:
     return PlanResult(
         estimated_input_tokens=ein,
         estimated_output_tokens=eout,
         plan_text="p",
+        predicted_files=files or [],
         session_id="s",
     )
 
@@ -711,6 +721,55 @@ def test_dry_run_does_not_invoke_planner(tmp_path):
     orch, gh, implementer, _ = make_orch(tmp_path, issues=[ticket(1)], planner=planner)
     orch.run(dry_run=True)
     assert planner.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# Pre-flight scope: escalate on a predicted violation, never spend (#32)
+# --------------------------------------------------------------------------- #
+def test_preflight_scope_denylist_escalates_without_spending(tmp_path):
+    # Planner predicts a denylisted path -> escalate BEFORE implementing.
+    planner = FakePlanner(_plan(files=["infra/deploy.tf"]))
+    orch, gh, implementer, _ = make_orch(tmp_path, issues=[ticket(1)], planner=planner)
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.SKIPPED
+    assert planner.calls == [(1, str(tmp_path))]  # the cheap plan ran ...
+    assert implementer.calls == []  # ... but no implementation budget was spent
+    assert gh.prs == []  # no work, so no PR (the only valid "no PR" outcome)
+    assert (1, "idle:needs-human") in gh.added_labels
+    assert any("allow-sensitive" in body for _, body in gh.comments)
+
+
+def test_preflight_scope_outside_allowlist_escalates(tmp_path):
+    planner = FakePlanner(_plan(files=["lib/x.py"]))  # neither allow- nor denylisted
+    orch, gh, implementer, _ = make_orch(tmp_path, issues=[ticket(1)], planner=planner)
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.SKIPPED
+    assert implementer.calls == []
+
+
+def test_preflight_scope_waived_by_allow_sensitive(tmp_path):
+    # The allow-sensitive label opts past the path bound: implement as normal.
+    t = ticket(1)
+    t.labels = ["idle:ready", "idle:allow-sensitive"]
+    planner = FakePlanner(_plan(files=["infra/deploy.tf"]))
+    orch, gh, implementer, _ = make_orch(
+        tmp_path, issues=[t], planner=planner, require_human=False
+    )
+    rec = orch.process_ticket(t)
+    assert implementer.calls  # the violation is waived -> work proceeds
+    assert rec.outcome == Outcome.MERGED
+
+
+def test_preflight_scope_allows_in_allowlist_predicted_files(tmp_path):
+    # Predicted files inside the allowlist -> no escalation, happy path runs.
+    planner = FakePlanner(_plan(files=["src/feature.py", "tests/test_feature.py"]))
+    orch, gh, implementer, _ = make_orch(
+        tmp_path, issues=[ticket(1)], planner=planner, require_human=False
+    )
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.MERGED
+    assert implementer.calls  # implemented normally
+    assert len(gh.prs) == 1 and gh.prs[0]["draft"] is False
 
 
 def test_branch_pushed_before_pr(tmp_path):

@@ -15,7 +15,7 @@ No API key — auth is the Claude Code login.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from agents.harness import ClaudeHarness
 from agents.implementer import save_session
@@ -46,7 +46,12 @@ Acceptance criteria:
 
 Respond with ONLY a single JSON object (no prose, no markdown fences) of the form:
 {{"estimated_input_tokens": <int>, "estimated_output_tokens": <int>, \
-"plan": "<2-4 sentence plan>", "rationale": "<one sentence on the token figure>"}}"""
+"files": ["<repo-relative path you will create or modify>", ...], \
+"plan": "<2-4 sentence plan>", "rationale": "<one sentence on the token figure>"}}
+
+``files`` must list every repo-relative path the implementation will create or \
+modify (best effort — it gates a pre-flight scope check, so don't omit edits to \
+config, CI, or scripts you intend to touch)."""
 
 
 @dataclass
@@ -56,6 +61,7 @@ class PlanResult:
     estimated_input_tokens: int
     estimated_output_tokens: int
     plan_text: str = ""
+    predicted_files: list[str] = field(default_factory=list)
     session_id: str = ""
     cost_usd: float = 0.0  # what the planning pass itself cost
     input_tokens: int = 0  # tokens the planning pass itself consumed
@@ -109,10 +115,20 @@ class Planner:
         if est_in < 0 or est_out < 0 or (est_in + est_out) == 0:
             return None
 
+        # Predicted file set is best-effort: keep only string entries, drop the
+        # rest. An absent/garbled list yields [] (pre-flight scope simply skips).
+        raw_files = data.get("files", [])
+        predicted_files = (
+            [f for f in raw_files if isinstance(f, str) and f.strip()]
+            if isinstance(raw_files, list)
+            else []
+        )
+
         return PlanResult(
             estimated_input_tokens=est_in,
             estimated_output_tokens=est_out,
             plan_text=str(data.get("plan", "")),
+            predicted_files=predicted_files,
             session_id=result.session_id,
             cost_usd=result.cost_usd,
             input_tokens=result.input_tokens,

@@ -66,6 +66,34 @@ def test_valid_budget_parsed(tmp_path):
     assert res.estimated_output_tokens == 300_000
     assert res.total_tokens == 1_800_000
     assert res.plan_text == "do the thing"
+    assert res.predicted_files == []  # absent "files" -> empty (pre-flight skips)
+
+
+def test_predicted_files_parsed_and_sanitised(tmp_path):
+    text = json.dumps(
+        {
+            "estimated_input_tokens": 1000,
+            "estimated_output_tokens": 500,
+            "plan": "p",
+            "files": ["src/a.py", "tests/test_a.py", "", 7, None],
+        }
+    )
+    res = planner(text)[0].plan(ticket(), str(tmp_path))
+    assert res is not None
+    # Only non-empty string entries survive; non-strings/blanks are dropped.
+    assert res.predicted_files == ["src/a.py", "tests/test_a.py"]
+
+
+def test_predicted_files_non_list_is_empty(tmp_path):
+    text = json.dumps(
+        {
+            "estimated_input_tokens": 1000,
+            "estimated_output_tokens": 500,
+            "files": "src/a.py",  # not a list -> ignored
+        }
+    )
+    res = planner(text)[0].plan(ticket(), str(tmp_path))
+    assert res is not None and res.predicted_files == []
 
 
 def test_seeds_session_file_for_implementer_resume(tmp_path):

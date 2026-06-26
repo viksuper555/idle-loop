@@ -35,7 +35,7 @@ from github_client import GitHubClient, GitHubError
 from guards.base import Guard, GuardContext, run_all
 from guards.budget import BudgetGuard, effective_caps
 from guards.estimate import Estimator
-from guards.scope import ScopeGuard
+from guards.scope import ScopeGuard, path_scope_violation
 from guards.security import SecurityGuard
 from guards.tests import TestsGuard
 from models import (
@@ -248,6 +248,7 @@ class Orchestrator:
             estimated_input_tokens=plan.estimated_input_tokens,
             estimated_output_tokens=plan.estimated_output_tokens,
             source="planner",
+            predicted_files=list(plan.predicted_files),
         )
 
     # ------------------------------------------------------------------ #
@@ -321,6 +322,25 @@ class Orchestrator:
             self._flag_needs_human(ticket)
             return self._record(ticket, estimate, None, Outcome.SKIPPED)
 
+        # (3.5) Pre-flight scope: a scope/path violation is knowable from the
+        # planner's predicted file set BEFORE any work exists. If predicted files
+        # hit the denylist (without allow-sensitive) or fall outside the allowlist,
+        # escalate and spend nothing — never burn the implementation budget on a
+        # change that the scope guard would reject afterwards. (Skipped when no
+        # files were predicted — e.g. the heuristic fallback — so the post-hoc
+        # ScopeGuard still backstops it.)
+        violation = (
+            path_scope_violation(self.config, ticket, estimate.predicted_files)
+            if estimate.predicted_files
+            else None
+        )
+        if violation is not None:
+            reason, _path = violation
+            self.log.info("#%s pre-flight scope violation: %s", ticket.number, reason)
+            self._comment(ticket, _preflight_scope_message(reason, self.config))
+            self._flag_needs_human(ticket)
+            return self._record(ticket, estimate, None, Outcome.SKIPPED)
+
         # (4) Implement on a fresh isolated branch (named <prefix>/issue-<id>).
         if branch is None:
             branch = self._branch_for(ticket)
@@ -356,10 +376,11 @@ class Orchestrator:
         if failed is not None:
             outcome = Outcome.FAILED if impl.error else Outcome.PARKED
             self.log.info("#%s guard '%s' failed: %s", ticket.number, failed.name, failed.reason)
-            self._park(
-                ticket,
-                f"**Guard `{failed.name}` failed:** {failed.reason}\n\n"
-                + _gates_summary(results),
+            # The work is committed — never strand it locally. Push the branch and
+            # open a DRAFT PR carrying the work + the failure reason, flagged for a
+            # human, instead of parking with no PR.
+            self._open_blocked_pr(
+                ticket, branch, impl, results, estimate, repo_dir, failed
             )
             return self._record(ticket, estimate, impl, outcome)
 
@@ -893,6 +914,7 @@ class Orchestrator:
         results: list[GuardResult],
         estimate: EstimateResult | None = None,
         repo_dir: str | None = None,
+        draft: bool = False,
     ) -> dict | None:
         # Push the implementation branch first — GitHub can't open a PR for a
         # head ref that only exists locally.
@@ -918,18 +940,67 @@ class Orchestrator:
             )
             return existing
         body = pr_template.render_pr_body(self._pr_content(ticket, branch, impl, results, estimate))
+        title = f"[idle-loop] {ticket.title} (#{ticket.number})"
+        if draft:
+            title = f"[BLOCKED] {title}"
         try:
             pr = self.github.create_pull_request(
-                title=f"[idle-loop] {ticket.title} (#{ticket.number})",
+                title=title,
                 head=branch,
                 base=self.config.merge.target_branch,
                 body=body,
+                draft=draft,
             )
-            self.log.info("#%s opened PR #%s", ticket.number, pr.get("number"))
+            self.log.info(
+                "#%s opened %sPR #%s",
+                ticket.number,
+                "draft " if draft else "",
+                pr.get("number"),
+            )
             return pr
         except GitHubError as exc:
             self.log.warning("create_pull_request for #%s failed: %s", ticket.number, exc)
             return None
+
+    def _open_blocked_pr(
+        self,
+        ticket: Ticket,
+        branch: str,
+        impl: ImplementationResult,
+        results: list[GuardResult],
+        estimate: EstimateResult | None,
+        repo_dir: str,
+        failed: GuardResult,
+    ) -> None:
+        """Carry committed-but-blocked work onto a draft PR, flagged for a human.
+
+        Invariant: if the agent committed anything, a PR exists. A post-hoc guard
+        failure opens a *draft* PR (work + failure reason) labelled needs-human
+        rather than parking with the work stranded in a local worktree. Only if
+        even the draft PR can't be opened do we fall back to a plain park (the
+        branch is still pushed, so the work is recoverable).
+        """
+        reason = (
+            f"**Guard `{failed.name}` failed:** {failed.reason}\n\n"
+            + _gates_summary(results)
+        )
+        pr = self._open_pr(ticket, branch, impl, results, estimate, repo_dir, draft=True)
+        if pr is None:
+            self.log.warning("#%s could not open blocked draft PR; parking", ticket.number)
+            self._park(
+                ticket,
+                reason
+                + "\n\n_idle-loop could not open a draft PR; the branch "
+                f"`{branch}` was pushed — recover the work from there._",
+            )
+            return
+        self._flag_needs_human(ticket)
+        self._comment(
+            ticket,
+            "🅿️ **idle-loop opened a draft PR — blocked, needs a human.** "
+            "The work is committed and pushed, not stranded locally.\n\n"
+            f"{reason}\n\nDraft PR: {pr.get('html_url', '')}\n\n{SHIPPED_BY}",
+        )
 
     def _pr_content(
         self,
@@ -1376,6 +1447,27 @@ def _estimate_detail(estimate: EstimateResult) -> str:
         f"- est. iterations: {estimate.estimated_iterations:.1f}\n"
         f"- confidence: {estimate.confidence:.2f}\n"
         "</details>"
+    )
+
+
+def _preflight_scope_message(reason: str, config: Config) -> str:
+    """Escalation comment for a pre-flight scope violation (no budget spent).
+
+    Offers the ``allow_sensitive`` override (the parked-action resolution) so a
+    maintainer can opt the ticket past the path bound without idle-loop having
+    spent a token on a change it would only reject afterwards.
+    """
+    allow = config.labels.allow_sensitive
+    return (
+        "🅿️ **idle-loop parked this before implementing — predicted scope "
+        "violation.**\n\n"
+        f"The planned change would {reason}.\n\n"
+        "No implementation budget was spent: a scope/path failure is knowable "
+        "from the plan, so the loop escalates instead of burning tokens on work "
+        "the scope guard would reject.\n\n"
+        f"**To proceed:** label this `{allow}` to opt the ticket past the path "
+        "bound (the loop will then implement and open a PR for review), or adjust "
+        f"the ticket so the change stays inside the allowlist.\n\n{SHIPPED_BY}"
     )
 
 
