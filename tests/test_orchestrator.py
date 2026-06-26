@@ -196,6 +196,16 @@ def test_dry_run_lists_issues_and_takes_no_action(tmp_path, capsys):
     assert implementer.calls == [] and reviewer.calls == []
 
 
+def test_run_ensures_idle_labels_before_processing(tmp_path):
+    # A normal run() must sync the idle:* labels before touching tickets — the
+    # CI no longer owns this, so the loop itself guarantees they exist.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False
+    )
+    orch.run()
+    assert gh.ensured == [["idle:ready", "idle:needs-human", "idle:allow-sensitive"]]
+
+
 def test_ticket_without_acceptance_criteria_is_skipped(tmp_path):
     orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1, criteria=[])])
     rec = orch.process_ticket(ticket(1, criteria=[]))
