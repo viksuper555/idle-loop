@@ -164,10 +164,14 @@ class ClaudeHarness:
         allowed_tools: list[str] | None,
         disallowed_tools: list[str] | None,
         model: str | None,
+        resume_session_id: str | None = None,
     ) -> list[str]:
         cmd = [self.claude_bin, "-p", prompt, "--output-format", self.config.harness.output_format]
         if model:
             cmd += ["--model", model]
+        if resume_session_id:
+            # Continue the prior conversation for this ticket, preserving context.
+            cmd += ["--resume", resume_session_id]
         if skip_permissions:
             cmd.append("--dangerously-skip-permissions")
         if allowed_tools:
@@ -186,8 +190,14 @@ class ClaudeHarness:
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
         model: str | None = None,
+        resume_session_id: str | None = None,
     ) -> HarnessResult:
-        """Invoke ``claude -p`` in ``cwd``; raise :class:`HarnessRateLimited` on a limit."""
+        """Invoke ``claude -p`` in ``cwd``; raise :class:`HarnessRateLimited` on a limit.
+
+        ``resume_session_id`` continues a prior ``claude`` session so the agent
+        keeps its context across invocations (e.g. revision rounds, or a later
+        loop run picking the ticket back up in its persistent worktree).
+        """
         if skip_permissions is None:
             skip_permissions = self.config.harness.skip_permissions
         if model is None:
@@ -199,6 +209,7 @@ class ClaudeHarness:
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
             model=model,
+            resume_session_id=resume_session_id,
         )
 
         try:

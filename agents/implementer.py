@@ -19,6 +19,12 @@ from agents.harness import ClaudeHarness, HarnessRateLimited
 from config import Config
 from models import ImplementationResult, Ticket
 
+# Per-worktree file holding the claude session id, so a later invocation
+# (revision round, or a subsequent loop run resuming the ticket in its
+# persistent worktree) continues the same conversation. Under .idle-loop/,
+# which is gitignored.
+_SESSION_FILE = ".idle-loop/session"
+
 _SYSTEM = (
     "You are an autonomous implementer working a single GitHub ticket on an "
     "isolated git branch inside the current working directory. Read the ticket "
@@ -140,6 +146,28 @@ class Implementer:
         return "\n\n".join(parts) + "\n"
 
     # ------------------------------------------------------------------ #
+    # Session persistence (context continuity across invocations)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _load_session(repo_dir: str) -> str | None:
+        try:
+            sid = (Path(repo_dir) / _SESSION_FILE).read_text(encoding="utf-8").strip()
+            return sid or None
+        except OSError:
+            return None
+
+    @staticmethod
+    def _save_session(repo_dir: str, session_id: str) -> None:
+        if not session_id:
+            return
+        try:
+            path = Path(repo_dir) / _SESSION_FILE
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(session_id, encoding="utf-8")
+        except OSError:
+            pass  # context continuity is best-effort, never fatal
+
+    # ------------------------------------------------------------------ #
     # Entry point
     # ------------------------------------------------------------------ #
     def run(
@@ -153,15 +181,24 @@ class Implementer:
 
         When ``feedback`` is given, the implementer revises its existing work on
         the same branch to address a reviewer's requested changes rather than
-        starting a fresh implementation.
+        starting a fresh implementation. A saved claude session for this worktree
+        is resumed so the agent keeps prior context; the (possibly new) session
+        id is persisted back for the next invocation.
         """
+        resume = self._load_session(repo_dir)
         try:
             self._start_branch(repo_dir, branch)
-            result = self.harness.run(self._prompt(ticket, feedback), cwd=repo_dir)
+            result = self.harness.run(
+                self._prompt(ticket, feedback),
+                cwd=repo_dir,
+                resume_session_id=resume,
+            )
         except HarnessRateLimited:
             raise  # propagate so the loop stops and the listener reschedules
         except Exception as exc:  # noqa: BLE001 - return a failed result, never raise
             return ImplementationResult(branch=branch, error=str(exc) or type(exc).__name__)
+
+        self._save_session(repo_dir, result.session_id)
 
         base = self.config.merge.target_branch
         diff = self._diff(repo_dir, base)

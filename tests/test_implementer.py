@@ -125,6 +125,23 @@ def test_prompt_includes_reviewer_feedback_on_revision(monkeypatch, tmp_path):
     assert "cover the Y case" in prompt
 
 
+def test_session_is_persisted_then_resumed(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    harness = FakeHarness(
+        HarnessResult(text="ok", cost_usd=0.1, num_turns=2, session_id="sess-abc")
+    )
+    impl = Implementer(Config(repo="o/n"), harness=harness)
+
+    # First run: no prior session -> no resume; the new session id is saved.
+    impl.run(ticket(1), str(tmp_path), "idle/issue-1")
+    assert harness.calls[0].get("resume_session_id") is None
+    assert (tmp_path / ".idle-loop" / "session").read_text(encoding="utf-8") == "sess-abc"
+
+    # Second run (e.g. a revision): the saved session is resumed for context.
+    impl.run(ticket(1), str(tmp_path), "idle/issue-1", feedback="fix X")
+    assert harness.calls[1].get("resume_session_id") == "sess-abc"
+
+
 def test_safe_path_rejects_traversal(tmp_path):
     impl = Implementer(Config(repo="o/n"), harness=FakeHarness())
     assert str(impl._safe_path(str(tmp_path), "src/x.py")).startswith(str(tmp_path.resolve()))

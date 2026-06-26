@@ -192,6 +192,28 @@ class GitHubClient:
         data = resp.json()
         return {"number": data["number"], "html_url": data["html_url"]}
 
+    def pr_status_for_branch(self, branch: str) -> str:
+        """Classify the PR lifecycle for head ``branch``.
+
+        Returns ``"open"`` if an open PR exists, ``"done"`` if one or more PRs
+        exist but none are open (merged or closed), or ``"none"`` if the branch
+        never had a PR. Used to decide a ticket worktree's fate: keep it while
+        ``"open"`` (work may resume), reclaim it once ``"done"``, and leave it
+        alone while ``"none"`` (implementation may be mid-flight, pre-PR).
+        """
+        owner = self.repo.split("/", 1)[0]
+        resp = self._request(
+            "GET",
+            f"/repos/{self.repo}/pulls",
+            params={"head": f"{owner}:{branch}", "state": "all"},
+        )
+        prs = resp.json()
+        if not prs:
+            return "none"
+        if any(pr.get("state") == "open" for pr in prs):
+            return "open"
+        return "done"
+
     def pull_request_checks_passing(self, number: int) -> bool:
         """Return whether all check-runs on the PR's head commit pass.
 

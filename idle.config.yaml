@@ -18,6 +18,8 @@ budget:
   no_progress_limit: 3            # same error / empty diff N times -> bail
   review_iterations: 2            # send reviewer feedback back to the implementer
                                   # on the same branch N times before parking
+  max_parallel: 3                 # tickets worked at once, each in its own git
+                                  # worktree (1 = sequential)
 
 guards:
   max_diff_lines: 400

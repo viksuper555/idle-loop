@@ -133,6 +133,8 @@ def make_config(tmp_path, **over) -> Config:
         cfg.triage.auto_threshold_usd = over["threshold"]
     if "global_cap" in over:
         cfg.budget.global_cap_usd = over["global_cap"]
+    # Default tests to the sequential path; parallel tests opt in explicitly.
+    cfg.budget.max_parallel = over.get("max_parallel", 1)
     return cfg
 
 
@@ -352,6 +354,66 @@ def test_global_cap_stops_the_loop(tmp_path):
     records = orch.run()
     assert len(records) == 1
     assert records[0].outcome == Outcome.MERGED
+
+
+def test_parallel_processes_all_tickets_in_isolated_worktrees(tmp_path):
+    # 3 tickets, 2 at a time. Fake the worktree helpers (no real git) and assert
+    # each ticket is processed in its own worktree path.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path,
+        issues=[ticket(1), ticket(2), ticket(3)],
+        require_human=False,
+        max_parallel=2,
+    )
+    made: list[int] = []
+    removed: list[str] = []
+
+    def fake_make(ticket):
+        path = str(tmp_path / f"wt-{ticket.number}")
+        made.append(ticket.number)
+        return path
+
+    orch._make_worktree = fake_make
+    orch._remove_worktree = lambda p: removed.append(p)
+
+    records = orch.run()
+
+    assert {r.ticket_id for r in records} == {1, 2, 3}
+    assert all(r.outcome == Outcome.MERGED for r in records)
+    assert sorted(made) == [1, 2, 3]  # one worktree per ticket
+    # Worktrees persist past the pass — reclaimed later by reap, not here.
+    assert removed == []
+    # Each implementer run got a distinct per-ticket worktree, not the shared dir.
+    repo_dirs = {repo_dir for _, repo_dir, _ in implementer.calls}
+    assert repo_dirs == {str(tmp_path / "wt-1"), str(tmp_path / "wt-2"), str(tmp_path / "wt-3")}
+
+
+def test_reap_removes_only_finished_pr_worktrees(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[])
+    root = tmp_path / ".idle-worktrees"
+    for n in (1, 2, 3):
+        (root / f"issue-{n}").mkdir(parents=True)
+    # #1 merged/closed -> reap; #2 still open -> keep; #3 no PR yet -> keep.
+    status = {"idle/issue-1": "done", "idle/issue-2": "open", "idle/issue-3": "none"}
+    gh.pr_status_for_branch = lambda branch: status[branch]
+    removed: list[str] = []
+    orch._remove_worktree = lambda p: removed.append(p)
+
+    orch._reap_worktrees()
+
+    assert removed == [str(root / "issue-1")]
+
+
+def test_max_parallel_one_uses_sequential_path(tmp_path):
+    # max_parallel=1 must not create worktrees at all.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1), ticket(2)], require_human=False, max_parallel=1
+    )
+    called = []
+    orch._make_worktree = lambda t: called.append(t.number) or str(tmp_path)
+    records = orch.run()
+    assert len(records) == 2
+    assert called == []  # sequential path never makes a worktree
 
 
 def test_run_records_are_appended_to_cost_log(tmp_path):

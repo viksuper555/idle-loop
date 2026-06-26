@@ -35,6 +35,8 @@ class Budget:
     no_progress_limit: int = 3  # identical error / empty diff N times -> bail
     review_iterations: int = 2  # times to send reviewer feedback back to the
     # implementer on the SAME branch before parking for a human
+    max_parallel: int = 3  # tickets worked concurrently, each in its own git
+    # worktree (1 = sequential). Concurrent runs share the same usage window.
 
 
 @dataclass

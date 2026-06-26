@@ -21,6 +21,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Sequence
 from datetime import datetime
 
@@ -53,6 +54,9 @@ EXIT_OK = 0
 EXIT_RATE_LIMITED = 42
 # Where a rate-limit reset time is persisted for the listener to read.
 RATE_LIMIT_STATE = ".idle-loop/rate_limit.json"
+# Directory (under repo_dir) holding the per-ticket git worktrees used when
+# tickets are worked in parallel. Gitignored.
+WORKTREE_DIR = ".idle-worktrees"
 
 
 class Orchestrator:
@@ -79,6 +83,8 @@ class Orchestrator:
         self.repo_dir = repo_dir
         self.log = logger or log
         self._repo_tree_cache: list[str] | None = None
+        # Serializes cost-log appends across parallel ticket workers.
+        self._cost_log_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -137,10 +143,16 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     # Per-ticket processing (SPEC steps 2-9)
     # ------------------------------------------------------------------ #
-    def process_ticket(self, ticket: Ticket) -> RunRecord:
-        """Process one ticket end-to-end. Never raises (except rate-limit)."""
+    def process_ticket(self, ticket: Ticket, repo_dir: str | None = None) -> RunRecord:
+        """Process one ticket end-to-end. Never raises (except rate-limit).
+
+        ``repo_dir`` is the working tree the implementer commits in; it defaults
+        to the orchestrator's own checkout, but is overridden with a per-ticket
+        git worktree when tickets are worked in parallel.
+        """
+        repo_dir = repo_dir or self.repo_dir
         try:
-            return self._process_ticket(ticket)
+            return self._process_ticket(ticket, repo_dir)
         except HarnessRateLimited:
             raise  # stop the whole loop; the listener will reschedule
         except Exception as exc:  # noqa: BLE001 - one bad ticket must not kill the loop
@@ -151,7 +163,7 @@ class Orchestrator:
             )
             return self._record(ticket, None, None, Outcome.FAILED)
 
-    def _process_ticket(self, ticket: Ticket) -> RunRecord:
+    def _process_ticket(self, ticket: Ticket, repo_dir: str) -> RunRecord:
         labels = self.config.labels
 
         # (1) Reject tickets without acceptance criteria — never guess (SPEC §4).
@@ -193,7 +205,7 @@ class Orchestrator:
         # (4) Implement on a fresh isolated branch.
         branch = f"idle/issue-{ticket.number}"
         self.log.info("#%s implementing on %s", ticket.number, branch)
-        impl = self.implementer.run(ticket, self.repo_dir, branch)
+        impl = self.implementer.run(ticket, repo_dir, branch)
         self.log.info(
             "#%s implemented: %d files, %d iters, $%.2f%s",
             ticket.number,
@@ -207,7 +219,7 @@ class Orchestrator:
         ctx = GuardContext(
             ticket=ticket,
             config=self.config,
-            repo_dir=self.repo_dir,
+            repo_dir=repo_dir,
             diff=impl.diff,
             files_changed=impl.files_changed,
             implementation=impl,
@@ -225,7 +237,7 @@ class Orchestrator:
             return self._record(ticket, estimate, impl, outcome)
 
         # (6) Push the branch and open the PR linking the issue.
-        pr = self._open_pr(ticket, branch, impl, results)
+        pr = self._open_pr(ticket, branch, impl, results, repo_dir)
         if pr is None:
             self.log.info("#%s could not push branch / open PR; parking", ticket.number)
             self._park(
@@ -261,7 +273,7 @@ class Orchestrator:
                 self.config.budget.review_iterations,
             )
             impl = self.implementer.run(
-                ticket, self.repo_dir, branch, feedback=_review_feedback(verdict)
+                ticket, repo_dir, branch, feedback=_review_feedback(verdict)
             )
             total_cost += impl.cost_usd
             self.log.info(
@@ -280,7 +292,7 @@ class Orchestrator:
             ctx = GuardContext(
                 ticket=ticket,
                 config=self.config,
-                repo_dir=self.repo_dir,
+                repo_dir=repo_dir,
                 diff=impl.diff,
                 files_changed=impl.files_changed,
                 implementation=impl,
@@ -303,7 +315,7 @@ class Orchestrator:
                 return self._record(ticket, estimate, impl, Outcome.PARKED)
 
             # Push the revision — the existing PR updates in place.
-            if not self.implementer.push_branch(self.repo_dir, branch):
+            if not self.implementer.push_branch(repo_dir, branch):
                 impl.cost_usd = total_cost
                 self.log.info("#%s could not push revision; parking", ticket.number)
                 self._park(
@@ -338,8 +350,18 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     # Loop
     # ------------------------------------------------------------------ #
-    def run(self, max_tickets: int | None = None, dry_run: bool = False) -> list[RunRecord]:
-        """Process ready tickets until the backlog, cap, or limit is reached."""
+    def run(
+        self,
+        max_tickets: int | None = None,
+        dry_run: bool = False,
+        max_parallel: int | None = None,
+    ) -> list[RunRecord]:
+        """Process ready tickets until the backlog, cap, or limit is reached.
+
+        ``max_parallel`` (defaults to ``budget.max_parallel``) caps how many
+        tickets are worked concurrently — each in its own git worktree so the
+        implementers never clobber one another's checkout. ``1`` is sequential.
+        """
         tickets = self.discover()
         self.log.info("discovered %d ready ticket(s)", len(tickets))
 
@@ -350,30 +372,178 @@ class Orchestrator:
                 print(f"#{ticket.number}  {ticket.title}  {band}")
             return []
 
+        if max_tickets is not None:
+            tickets = tickets[:max_tickets]
+
         # Mutations begin here — only for real runs (dry-run takes no action).
         self._ensure_labels()
-        records: list[RunRecord] = []
-        spent = 0.0
+        # Reclaim worktrees whose PRs have since merged/closed before dispatching.
+        self._reap_worktrees()
+
+        parallel = self.config.budget.max_parallel if max_parallel is None else max_parallel
+        parallel = max(1, parallel)
         try:
-            for ticket in tickets:
-                if max_tickets is not None and len(records) >= max_tickets:
-                    self.log.info("reached max-tickets=%d; stopping", max_tickets)
-                    break
-                if spent >= self.config.budget.global_cap_usd:
-                    self.log.info(
-                        "global cap $%g reached (spent $%.2f); stopping",
-                        self.config.budget.global_cap_usd,
-                        spent,
-                    )
-                    break
-                record = self.process_ticket(ticket)
-                records.append(record)
-                spent += record.actual_cost
+            if parallel == 1 or len(tickets) <= 1:
+                records = self._run_sequential(tickets)
+            else:
+                records = self._run_parallel(tickets, parallel)
         except HarnessRateLimited as exc:
             self._on_rate_limit(exc)
             raise
+        spent = sum(r.actual_cost for r in records)
         self.log.info("processed %d ticket(s); spent ~$%.2f", len(records), spent)
         return records
+
+    def _run_sequential(self, tickets: list[Ticket]) -> list[RunRecord]:
+        """Work tickets one at a time in the orchestrator's own checkout."""
+        records: list[RunRecord] = []
+        spent = 0.0
+        for ticket in tickets:
+            if spent >= self.config.budget.global_cap_usd:
+                self.log.info(
+                    "global cap $%g reached (spent $%.2f); stopping",
+                    self.config.budget.global_cap_usd,
+                    spent,
+                )
+                break
+            record = self.process_ticket(ticket)
+            records.append(record)
+            spent += record.actual_cost
+        return records
+
+    def _run_parallel(self, tickets: list[Ticket], parallel: int) -> list[RunRecord]:
+        """Work up to ``parallel`` tickets at once, each in its own git worktree.
+
+        Submission is throttled by the global cost cap: once cumulative spend
+        crosses ``budget.global_cap_usd`` no further tickets are dispatched, and
+        already-running ones are allowed to finish. A :class:`HarnessRateLimited`
+        from any worker is re-raised after the pool drains so the listener can
+        reschedule.
+        """
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        self.log.info("working %d ticket(s), up to %d in parallel", len(tickets), parallel)
+
+        def work(ticket: Ticket) -> RunRecord:
+            # The worktree persists after the pass — it is reclaimed only once
+            # the ticket's PR is merged/closed (see _reap_worktrees), so work can
+            # resume in it (with saved agent context) on a later run.
+            worktree = self._make_worktree(ticket)
+            return self.process_ticket(ticket, repo_dir=worktree)
+
+        records: list[RunRecord] = []
+        spent = 0.0
+        rate_limited: HarnessRateLimited | None = None
+        pending: set = set()
+        queue = iter(tickets)
+        cap = self.config.budget.global_cap_usd
+
+        with ThreadPoolExecutor(max_workers=parallel) as pool:
+            # Prime the pool.
+            for _ in range(parallel):
+                ticket = next(queue, None)
+                if ticket is None:
+                    break
+                pending.add(pool.submit(work, ticket))
+
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    try:
+                        record = fut.result()
+                    except HarnessRateLimited as exc:
+                        rate_limited = exc
+                        continue
+                    records.append(record)
+                    spent += record.actual_cost
+
+                if rate_limited is not None:
+                    continue  # stop dispatching; let running tickets drain
+                if spent >= cap:
+                    self.log.info(
+                        "global cap $%g reached (spent $%.2f); not dispatching more",
+                        cap,
+                        spent,
+                    )
+                    continue
+                # Backfill a free slot.
+                for _ in range(len(done)):
+                    ticket = next(queue, None)
+                    if ticket is None:
+                        break
+                    pending.add(pool.submit(work, ticket))
+
+        if rate_limited is not None:
+            raise rate_limited
+        return records
+
+    # ------------------------------------------------------------------ #
+    # Git worktrees (isolation for parallel tickets)
+    # ------------------------------------------------------------------ #
+    def _worktree_git(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", self.repo_dir, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+
+    def _worktree_path(self, number: int) -> str:
+        return os.path.join(self.repo_dir, WORKTREE_DIR, f"issue-{number}")
+
+    def _make_worktree(self, ticket: Ticket) -> str:
+        """Return an isolated git worktree for ``ticket``, creating it if needed.
+
+        An existing worktree for the ticket is reused as-is — its branch and the
+        agent's prior work are preserved so the implementer continues where it
+        left off. A new worktree is checked out (detached) at the target branch
+        so the implementer's own ``checkout -b idle/issue-N`` starts clean.
+        """
+        path = self._worktree_path(ticket.number)
+        if os.path.isdir(path):
+            self.log.info("#%s reusing worktree %s", ticket.number, path)
+            return path
+        base = self.config.merge.target_branch
+        self._worktree_git("worktree", "prune")
+        proc = self._worktree_git("worktree", "add", "--detach", "--force", path, base)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"git worktree add failed for #{ticket.number}: {proc.stderr.strip()}"
+            )
+        return path
+
+    def _remove_worktree(self, path: str) -> None:
+        """Tear down a ticket worktree (best-effort; never raises)."""
+        self._worktree_git("worktree", "remove", "--force", path)
+        self._worktree_git("worktree", "prune")
+
+    def _reap_worktrees(self) -> None:
+        """Remove worktrees whose ticket PR has been merged or closed.
+
+        Run before dispatching a batch: any worktree whose branch has a finished
+        PR is reclaimed; worktrees with an open PR (resumable) or no PR yet
+        (pre-PR, possibly mid-flight) are left in place.
+        """
+        root = os.path.join(self.repo_dir, WORKTREE_DIR)
+        if not os.path.isdir(root):
+            return
+        for name in sorted(os.listdir(root)):
+            if not name.startswith("issue-"):
+                continue
+            try:
+                number = int(name[len("issue-"):])
+            except ValueError:
+                continue
+            branch = f"idle/issue-{number}"
+            try:
+                status = self.github.pr_status_for_branch(branch)
+            except GitHubError as exc:
+                self.log.warning("reap: PR status for %s failed: %s", branch, exc)
+                continue
+            if status == "done":
+                self.log.info("#%s PR merged/closed — reclaiming worktree", number)
+                self._remove_worktree(os.path.join(root, name))
 
     def _on_rate_limit(self, exc: HarnessRateLimited) -> None:
         """Persist the reset time and emit a marker the bash listener parses."""
@@ -436,10 +606,11 @@ class Orchestrator:
         branch: str,
         impl: ImplementationResult,
         results: list[GuardResult],
+        repo_dir: str | None = None,
     ) -> dict | None:
         # Push the implementation branch first — GitHub can't open a PR for a
         # head ref that only exists locally.
-        if not self.implementer.push_branch(self.repo_dir, branch):
+        if not self.implementer.push_branch(repo_dir or self.repo_dir, branch):
             self.log.warning("#%s push of branch %s failed", ticket.number, branch)
             return None
         body = (
@@ -505,7 +676,8 @@ class Orchestrator:
             outcome=str(outcome),
         )
         try:
-            append_record(record, self.config.cost_log_path)
+            with self._cost_log_lock:
+                append_record(record, self.config.cost_log_path)
         except Exception as exc:  # noqa: BLE001 - logging must not crash the loop
             self.log.warning("append to cost log failed: %s", exc)
         return record
@@ -593,6 +765,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="process at most N tickets this run",
     )
     parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=None,
+        help="work at most N tickets concurrently, each in its own git worktree "
+        "(default: budget.max_parallel; 1 = sequential)",
+    )
+    parser.add_argument(
         "--ensure-labels",
         action="store_true",
         help="create/update the idle:* labels on the repo and exit "
@@ -628,7 +807,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     orch = Orchestrator.from_config(config, repo_dir=args.repo_dir)
     try:
-        orch.run(max_tickets=args.max_tickets, dry_run=args.dry_run)
+        orch.run(
+            max_tickets=args.max_tickets,
+            dry_run=args.dry_run,
+            max_parallel=args.max_parallel,
+        )
     except HarnessRateLimited:
         # State + marker already emitted by Orchestrator._on_rate_limit.
         return EXIT_RATE_LIMITED
