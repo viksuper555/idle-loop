@@ -2,19 +2,18 @@
 #
 # The autonomous loop runs LOCALLY via ./idle-listener.sh — it needs the Claude
 # Code harness (your `claude` login), which a GitHub runner doesn't have. So the
-# only things GitHub Actions is good for here are:
+# only thing GitHub Actions is good for here is:
 #   * test   — ruff + pytest on every push / PR (the suite is fully mocked, no
 #              network, no claude).
-#   * labels — create/sync the static idle:* labels on the repo (GitHub token
-#              only; no harness). Runs on manual dispatch and weekly.
+#
+# The idle:* labels are ensured by the loop itself on every `python idle_loop.py`
+# run, or manually via `python idle_loop.py --ensure-labels` (token only).
 name: idle-loop CI
 
 on:
   push:
   pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * 1" # Mondays 06:00 UTC — keep the idle:* labels in sync
 
 permissions:
   contents: read
@@ -34,21 +33,3 @@ jobs:
         run: ruff check .
       - name: Test
         run: python -m pytest
-
-  labels:
-    # Static label sync — manual or weekly. Not run on push/PR.
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install
-        run: pip install -e ".[dev]"
-      - name: Ensure idle:* labels
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
-        run: python idle_loop.py --ensure-labels
