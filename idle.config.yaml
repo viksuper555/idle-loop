@@ -24,7 +24,7 @@ budget:
                                   # worktree (1 = sequential)
 
 guards:
-  max_diff_lines: 400
+  max_diff_lines: 4000          # real features run large; 400 parked everything
   max_files: 15
   path_allowlist: ["src/**", "tests/**", "*.py"]
   path_denylist: ["**/secrets/**", ".github/**", "infra/**", "**/migrations/**"]
