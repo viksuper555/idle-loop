@@ -16,11 +16,13 @@ budget:
   per_ticket_cap_usd: 40
   global_cap_usd: 200             # stop the whole loop here
   no_progress_limit: 3            # same error / empty diff N times -> bail
+  review_iterations: 2            # send reviewer feedback back to the implementer
+                                  # on the same branch N times before parking
 
 guards:
   max_diff_lines: 400
   max_files: 15
-  path_allowlist: ["src/**", "tests/**"]
+  path_allowlist: ["src/**", "tests/**", "*.py"]
   path_denylist: ["**/secrets/**", ".github/**", "infra/**", "**/migrations/**"]
   require_tests_for_new_behavior: true
 

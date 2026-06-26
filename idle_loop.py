@@ -235,9 +235,88 @@ class Orchestrator:
             )
             return self._record(ticket, estimate, impl, Outcome.PARKED)
 
-        # (7) Review against the acceptance criteria (separate agent/context).
+        # (7) Review against the acceptance criteria (separate agent/context),
+        # then iterate on the SAME branch/PR: feed the reviewer's requested
+        # changes back to the implementer up to budget.review_iterations times
+        # before parking. The open PR updates in place on each push — no new PR.
         verdict = self.reviewer.review(ticket, impl.diff)
         self.log.info("#%s review: %s", ticket.number, verdict.decision)
+
+        total_cost = impl.cost_usd
+        attempt = 0
+        while not verdict.approved and attempt < self.config.budget.review_iterations:
+            if total_cost >= self.config.budget.per_ticket_cap_usd:
+                self.log.info(
+                    "#%s per-ticket cap $%.2f reached before revision; parking",
+                    ticket.number,
+                    self.config.budget.per_ticket_cap_usd,
+                )
+                break
+            attempt += 1
+            self.log.info(
+                "#%s revising on %s (review attempt %d/%d)",
+                ticket.number,
+                branch,
+                attempt,
+                self.config.budget.review_iterations,
+            )
+            impl = self.implementer.run(
+                ticket, self.repo_dir, branch, feedback=_review_feedback(verdict)
+            )
+            total_cost += impl.cost_usd
+            self.log.info(
+                "#%s revised: %d files, %d iters, $%.2f (total $%.2f)%s",
+                ticket.number,
+                len(impl.files_changed),
+                impl.iterations,
+                impl.cost_usd,
+                total_cost,
+                " [error]" if impl.error else "",
+            )
+
+            # Re-run guards on the revised diff. A failure here (e.g. the revision
+            # ballooned past max_diff_lines) parks rather than looping further —
+            # a big diff is the signal to stop and let a human decide.
+            ctx = GuardContext(
+                ticket=ticket,
+                config=self.config,
+                repo_dir=self.repo_dir,
+                diff=impl.diff,
+                files_changed=impl.files_changed,
+                implementation=impl,
+            )
+            results = run_all(self.guards, ctx)
+            failed = next((r for r in results if not r.passed), None)
+            if failed is not None:
+                impl.cost_usd = total_cost
+                self.log.info(
+                    "#%s guard '%s' failed on revision: %s",
+                    ticket.number,
+                    failed.name,
+                    failed.reason,
+                )
+                self._park(
+                    ticket,
+                    f"**Guard `{failed.name}` failed on a revision:** {failed.reason}\n\n"
+                    + _gates_summary(results),
+                )
+                return self._record(ticket, estimate, impl, Outcome.PARKED)
+
+            # Push the revision — the existing PR updates in place.
+            if not self.implementer.push_branch(self.repo_dir, branch):
+                impl.cost_usd = total_cost
+                self.log.info("#%s could not push revision; parking", ticket.number)
+                self._park(
+                    ticket,
+                    f"idle-loop revised the change but could not push branch `{branch}`.",
+                )
+                return self._record(ticket, estimate, impl, Outcome.PARKED)
+
+            verdict = self.reviewer.review(ticket, impl.diff)
+            self.log.info("#%s review: %s", ticket.number, verdict.decision)
+
+        # Cost recorded/logged for the ticket is the cumulative spend.
+        impl.cost_usd = total_cost
 
         # (8) Decide.
         merged = (
@@ -443,6 +522,17 @@ def _gates_summary(results: list[GuardResult]) -> str:
         mark = "✅" if r.passed else "❌"
         lines.append(f"- {mark} `{r.name}` — {r.reason or ('passed' if r.passed else 'failed')}")
     return "\n".join(lines)
+
+
+def _review_feedback(verdict: ReviewVerdict) -> str:
+    """Render a reviewer verdict as actionable feedback for the implementer."""
+    lines = [verdict.summary.strip()] if verdict.summary.strip() else []
+    for c in verdict.comments:
+        loc = c.path or "(general)"
+        if c.line:
+            loc += f":{c.line}"
+        lines.append(f"- {loc}: {c.body}")
+    return "\n".join(lines) if lines else "The reviewer requested changes."
 
 
 def _estimate_detail(estimate: EstimateResult) -> str:

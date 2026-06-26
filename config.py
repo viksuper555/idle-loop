@@ -33,6 +33,8 @@ class Budget:
     per_ticket_cap_usd: float = 40.0
     global_cap_usd: float = 200.0
     no_progress_limit: int = 3  # identical error / empty diff N times -> bail
+    review_iterations: int = 2  # times to send reviewer feedback back to the
+    # implementer on the SAME branch before parking for a human
 
 
 @dataclass
