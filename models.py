@@ -139,6 +139,9 @@ class EstimateResult:
     estimated_input_tokens: int = 0
     estimated_output_tokens: int = 0
     source: str = "heuristic"  # "planner" (deterministic) | "heuristic" (fallback)
+    # Files the planner predicts the implementation will create/modify, used for
+    # the pre-flight scope check. Empty when the estimate is heuristic (no plan).
+    predicted_files: list[str] = field(default_factory=list)
 
     def band(self) -> str:
         """Render as ``~$30 ± $20`` — never false precision."""

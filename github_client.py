@@ -211,13 +211,23 @@ class GitHubClient:
     # Pull requests
     # ------------------------------------------------------------------ #
     def create_pull_request(
-        self, title: str, head: str, base: str, body: str
+        self, title: str, head: str, base: str, body: str, draft: bool = False
     ) -> dict:
-        """Open a PR and return ``{"number": int, "html_url": str}``."""
+        """Open a PR and return ``{"number": int, "html_url": str}``.
+
+        ``draft=True`` opens it as a draft — used to carry committed-but-blocked
+        work (a post-hoc guard failure) so spent work is never stranded locally.
+        """
         resp = self._request(
             "POST",
             f"/repos/{self.repo}/pulls",
-            json={"title": title, "head": head, "base": base, "body": body},
+            json={
+                "title": title,
+                "head": head,
+                "base": base,
+                "body": body,
+                "draft": draft,
+            },
         )
         data = resp.json()
         return {"number": data["number"], "html_url": data["html_url"]}
