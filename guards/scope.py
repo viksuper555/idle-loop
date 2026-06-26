@@ -99,20 +99,27 @@ class ScopeGuard:
 
         allow_sensitive = ctx.ticket.has_label(ctx.config.labels.allow_sensitive)
 
-        # 3) & 4) Per-file path checks.
+        # A ticket a human has labelled allow-sensitive is trusted: the per-file
+        # path checks (denylist + allowlist) are waived for it. This is the
+        # deliberate escape hatch that lets the loop modify its OWN
+        # infrastructure — config, scripts, CI — when a maintainer opts in.
+        # Without it the loop can never ship a change to a non-allowlisted path
+        # even WITH the label (the allowlist check below is unconditional), so it
+        # cannot, e.g., widen its own allowlist: the self-modification
+        # chicken-and-egg. The file-count / diff-line bounds above still apply,
+        # and merge.require_human keeps a human in the loop on the actual diff.
+        if allow_sensitive:
+            return GuardResult.ok(self.name)
+
+        # 3) & 4) Per-file path checks (untrusted tickets only).
         for path in files:
-            sensitive = match_any(path, guards.path_denylist)
-            if sensitive:
-                if not allow_sensitive:
-                    return GuardResult.fail(
-                        self.name,
-                        f"edits sensitive path {path} "
-                        f"(needs {ctx.config.labels.allow_sensitive} label)",
-                        files=[path],
-                    )
-                # Sensitive path explicitly allowed by label: bypasses the
-                # allowlist check too.
-                continue
+            if match_any(path, guards.path_denylist):
+                return GuardResult.fail(
+                    self.name,
+                    f"edits sensitive path {path} "
+                    f"(needs {ctx.config.labels.allow_sensitive} label)",
+                    files=[path],
+                )
 
             if not match_any(path, guards.path_allowlist):
                 return GuardResult.fail(

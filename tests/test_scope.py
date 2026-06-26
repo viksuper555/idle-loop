@@ -167,3 +167,36 @@ def test_outside_allowlist_fails():
     assert not res.passed
     assert "outside the path allowlist" in res.reason
     assert res.details["files"] == ["lib/x.py"]
+
+
+def test_allow_sensitive_waives_allowlist_for_unlisted_path():
+    # The self-modification escape hatch: a path that is neither allowlisted nor
+    # denylisted (e.g. the loop's own config) is rejected for a normal ticket but
+    # accepted once a human applies allow-sensitive. Without this the loop could
+    # never edit its own config/scripts even WITH the label.
+    cfg = _config(path_allowlist=["src/**", "tests/**"])
+    files = ["idle.config.yaml"]  # neither allowlisted nor denylisted
+    res = ScopeGuard(cfg).check(
+        GuardContext(ticket=_ticket(), config=cfg, files_changed=files, diff=_diff(files))
+    )
+    assert not res.passed
+    assert "outside the path allowlist" in res.reason
+
+    ticket = _ticket(labels=[cfg.labels.allow_sensitive])
+    res = ScopeGuard(cfg).check(
+        GuardContext(ticket=ticket, config=cfg, files_changed=files, diff=_diff(files))
+    )
+    assert res.passed, res.reason
+
+
+def test_allow_sensitive_still_bounded_by_file_count():
+    # The trust waiver covers PATH checks only — the size bounds still apply, so
+    # a labelled ticket can't smuggle in an unbounded change.
+    cfg = _config(max_files=2)
+    files = ["src/a.py", "src/b.py", "src/c.py"]
+    ticket = _ticket(labels=[cfg.labels.allow_sensitive])
+    res = ScopeGuard(cfg).check(
+        GuardContext(ticket=ticket, config=cfg, files_changed=files, diff=_diff(files))
+    )
+    assert not res.passed
+    assert "3 files" in res.reason
