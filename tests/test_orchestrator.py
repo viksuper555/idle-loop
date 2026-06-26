@@ -75,13 +75,17 @@ class FakeImplementer:
         self.push_ok = push_ok
         self.calls: list[tuple[int, str, str]] = []
         self.pushed: list[tuple[str, str]] = []
+        self.feedbacks: list[str | None] = []
 
     def push_branch(self, repo_dir: str, branch: str) -> bool:
         self.pushed.append((repo_dir, branch))
         return self.push_ok
 
-    def run(self, ticket: Ticket, repo_dir: str, branch: str) -> ImplementationResult:
+    def run(
+        self, ticket: Ticket, repo_dir: str, branch: str, feedback: str | None = None
+    ) -> ImplementationResult:
         self.calls.append((ticket.number, repo_dir, branch))
+        self.feedbacks.append(feedback)
         # Return a copy with the actual branch name filled in.
         r = self.result
         return ImplementationResult(
@@ -268,6 +272,62 @@ def test_reviewer_request_changes_parks_open_pr(tmp_path):
     assert gh.merged == []
     assert (1, "idle:needs-human") in gh.added_labels
     assert any("criterion 2 unmet" in body for _, body in gh.comments)
+
+
+class SequenceReviewer:
+    """Returns a scripted sequence of verdicts, repeating the last one."""
+
+    def __init__(self, verdicts):
+        self.verdicts = list(verdicts)
+        self.calls: list[int] = []
+
+    def review(self, ticket: Ticket, diff: str) -> ReviewVerdict:
+        self.calls.append(ticket.number)
+        i = min(len(self.calls) - 1, len(self.verdicts) - 1)
+        return self.verdicts[i]
+
+
+def test_reviewer_changes_then_approve_revises_same_branch_and_merges(tmp_path):
+    # request_changes first, approve on the revision.
+    reviewer = SequenceReviewer(
+        [
+            ReviewVerdict(
+                Decision.REQUEST_CHANGES,
+                summary="add the test",
+                comments=[ReviewComment(body="cover Y", path="src/feature.py", line=10)],
+            ),
+            ReviewVerdict(Decision.APPROVE, summary="now good"),
+        ]
+    )
+    orch, gh, implementer, _ = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False
+    )
+    orch.reviewer = reviewer
+
+    rec = orch.process_ticket(ticket(1))
+
+    assert rec.outcome == Outcome.MERGED
+    assert len(gh.prs) == 1  # one PR, updated in place — not a second PR
+    assert len(implementer.calls) == 2  # initial + one revision
+    assert implementer.feedbacks[0] is None  # initial pass, no feedback
+    assert implementer.feedbacks[1] and "cover Y" in implementer.feedbacks[1]
+    assert len(implementer.pushed) >= 2  # initial push + revision push
+
+
+def test_reviewer_persistent_changes_parks_after_review_iterations(tmp_path):
+    verdict = ReviewVerdict(Decision.REQUEST_CHANGES, summary="still wrong")
+    orch, gh, implementer, _ = make_orch(
+        tmp_path, issues=[ticket(1)], verdict=verdict, require_human=False
+    )
+    orch.config.budget.review_iterations = 2
+
+    rec = orch.process_ticket(ticket(1))
+
+    assert rec.outcome == Outcome.PARKED
+    assert len(gh.prs) == 1
+    assert gh.merged == []
+    # initial implementation + 2 bounded revision attempts, then park.
+    assert len(implementer.calls) == 3
 
 
 def test_approved_but_require_human_does_not_merge(tmp_path):
