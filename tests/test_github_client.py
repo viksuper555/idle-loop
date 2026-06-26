@@ -174,6 +174,57 @@ def test_comment_posts_body(monkeypatch):
     assert call["json"] == {"body": "hello"}
 
 
+def test_list_comments_paginates(monkeypatch):
+    payload = [{"id": 1, "body": "a"}, {"id": 2, "body": "b"}]
+    client, session = make_client(monkeypatch, [FakeResponse(200, payload)])
+    assert client.list_comments(7) == payload
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "https://api.github.com/repos/owner/name/issues/7/comments"
+    assert call["params"] == {"per_page": 100}
+
+
+def test_update_comment_patches_by_id(monkeypatch):
+    client, session = make_client(monkeypatch, [FakeResponse(200, {"id": 5})])
+    client.update_comment(5, "edited")
+    call = session.calls[0]
+    assert call["method"] == "PATCH"
+    assert call["url"] == "https://api.github.com/repos/owner/name/issues/comments/5"
+    assert call["json"] == {"body": "edited"}
+
+
+def test_upsert_comment_updates_existing_marked_comment(monkeypatch):
+    marker = "<!-- m -->"
+    client, session = make_client(
+        monkeypatch,
+        [
+            FakeResponse(200, [{"id": 9, "body": f"{marker}\nold"}]),  # list
+            FakeResponse(200, {"id": 9}),  # patch
+        ],
+    )
+    client.upsert_comment(7, marker, f"{marker}\nnew")
+    assert session.calls[0]["method"] == "GET"
+    assert session.calls[1]["method"] == "PATCH"
+    assert session.calls[1]["url"] == "https://api.github.com/repos/owner/name/issues/comments/9"
+    assert session.calls[1]["json"] == {"body": f"{marker}\nnew"}
+
+
+def test_upsert_comment_creates_when_absent(monkeypatch):
+    marker = "<!-- m -->"
+    client, session = make_client(
+        monkeypatch,
+        [
+            FakeResponse(200, [{"id": 9, "body": "unrelated"}]),  # list -> no marker
+            FakeResponse(201, {"id": 10}),  # create
+        ],
+    )
+    client.upsert_comment(7, marker, f"{marker}\nfresh")
+    assert session.calls[0]["method"] == "GET"
+    assert session.calls[1]["method"] == "POST"
+    assert session.calls[1]["url"] == "https://api.github.com/repos/owner/name/issues/7/comments"
+    assert session.calls[1]["json"] == {"body": f"{marker}\nfresh"}
+
+
 # --------------------------------------------------------------------------- #
 # Errors
 # --------------------------------------------------------------------------- #
