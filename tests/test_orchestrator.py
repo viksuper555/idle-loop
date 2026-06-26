@@ -284,6 +284,15 @@ def test_global_cap_stops_the_loop(tmp_path):
     assert records[0].outcome == Outcome.MERGED
 
 
+def test_run_ensures_idle_labels_before_processing(tmp_path):
+    # A normal run must sync the idle:* labels itself (no CI labels job needed).
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False
+    )
+    orch.run()
+    assert gh.ensured == [["idle:ready", "idle:needs-human", "idle:allow-sensitive"]]
+
+
 def test_run_records_are_appended_to_cost_log(tmp_path):
     import costlog
 
