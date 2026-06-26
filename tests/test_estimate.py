@@ -97,7 +97,10 @@ def test_est_files_clamped_to_at_least_one():
 # Monotonicity
 # --------------------------------------------------------------------------- #
 def test_more_criteria_raises_cost_and_iterations():
-    est = Estimator(make_config())
+    # Isolate from the live cost_log.jsonl: the similarity term (0.5 blend) is
+    # data-dependent and intentionally non-monotonic, so this heuristic test
+    # points at a non-existent log to exercise the heuristic alone.
+    est = Estimator(make_config(), cost_log_path="_no_such_cost_log.jsonl")
     small = est.estimate(make_ticket(criteria=["a"]))
     large = est.estimate(make_ticket(criteria=[f"c{i}" for i in range(8)]))
     assert large.estimated_iterations > small.estimated_iterations
@@ -105,7 +108,9 @@ def test_more_criteria_raises_cost_and_iterations():
 
 
 def test_more_criteria_monotonic_sequence():
-    est = Estimator(make_config())
+    # See above: isolate from the live cost log so the heuristic's monotonicity
+    # in criteria count is what's under test, not the similarity blend.
+    est = Estimator(make_config(), cost_log_path="_no_such_cost_log.jsonl")
     prev = -1.0
     for n in (0, 1, 3, 6, 10):
         result = est.estimate(make_ticket(criteria=[f"c{i}" for i in range(n)]))
