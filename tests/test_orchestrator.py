@@ -7,8 +7,14 @@ logic (triage, parking, merge gate, global cap, cost logging) in isolation.
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
+import idle_loop
+from agents.harness import HarnessRateLimited
 from config import Config
-from idle_loop import Orchestrator
+from idle_loop import EXIT_RATE_LIMITED, Orchestrator
 from models import (
     Decision,
     GuardResult,
@@ -296,3 +302,41 @@ def test_process_ticket_never_raises_on_crash(tmp_path):
     rec = orch.process_ticket(ticket(1))
     assert rec.outcome == Outcome.FAILED
     assert (1, "idle:needs-human") in gh.added_labels
+
+
+class RateLimitedImplementer:
+    def run(self, ticket, repo_dir, branch):
+        raise HarnessRateLimited(reset_at=2_000_000_000.0, reset_human="usage limit; resets 2:10am")
+
+
+def test_rate_limit_stops_loop_and_writes_state(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(idle_loop, "RATE_LIMIT_STATE", str(tmp_path / "rate_limit.json"))
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1), ticket(2)], require_human=False
+    )
+    orch.implementer = RateLimitedImplementer()
+
+    with pytest.raises(HarnessRateLimited):
+        orch.run()
+
+    # Loop stopped immediately — no PR, no merge, no second ticket.
+    assert gh.prs == [] and gh.merged == []
+    # Reset time persisted for the listener, and the marker line printed.
+    data = json.loads((tmp_path / "rate_limit.json").read_text())
+    assert data["reset_epoch"] == 2_000_000_000.0
+    assert "IDLE_LOOP_RATE_LIMITED" in capsys.readouterr().out
+
+
+def test_main_returns_rate_limited_exit_code(tmp_path, monkeypatch):
+    class Boom:
+        def run(self, **k):
+            raise HarnessRateLimited(reset_at=1.0, reset_human="limit")
+
+    monkeypatch.setattr(idle_loop, "load_config", lambda p: Config(repo="o/n"))
+    monkeypatch.setattr(
+        idle_loop.Orchestrator,
+        "from_config",
+        classmethod(lambda cls, config, repo_dir=".": Boom()),
+    )
+    rc = idle_loop.main(["--repo-dir", str(tmp_path)])
+    assert rc == EXIT_RATE_LIMITED

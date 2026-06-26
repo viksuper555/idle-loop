@@ -26,3 +26,5 @@ htmlcov/
 
 # idle-loop runtime scratch (worktrees the loop creates for tickets)
 .idle-worktrees/
+# listener state (rate-limit reset time, logs)
+.idle-loop/

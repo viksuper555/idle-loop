@@ -16,11 +16,15 @@ no Anthropic calls, no git.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import subprocess
 import sys
 from collections.abc import Sequence
+from datetime import datetime
 
+from agents.harness import HarnessRateLimited
 from config import Config, load_config
 from costlog import append_record
 from github_client import GitHubClient, GitHubError
@@ -43,6 +47,12 @@ from models import (
 log = logging.getLogger("idle_loop")
 
 SHIPPED_BY = "🤖 _Shipped by [idle-loop](https://github.com/viksuper555/idle-loop)._"
+
+# Exit codes the bash listener keys on.
+EXIT_OK = 0
+EXIT_RATE_LIMITED = 42
+# Where a rate-limit reset time is persisted for the listener to read.
+RATE_LIMIT_STATE = ".idle-loop/rate_limit.json"
 
 
 class Orchestrator:
@@ -128,9 +138,11 @@ class Orchestrator:
     # Per-ticket processing (SPEC steps 2-9)
     # ------------------------------------------------------------------ #
     def process_ticket(self, ticket: Ticket) -> RunRecord:
-        """Process one ticket end-to-end. Never raises — failures park/record."""
+        """Process one ticket end-to-end. Never raises (except rate-limit)."""
         try:
             return self._process_ticket(ticket)
+        except HarnessRateLimited:
+            raise  # stop the whole loop; the listener will reschedule
         except Exception as exc:  # noqa: BLE001 - one bad ticket must not kill the loop
             self.log.exception("ticket #%s crashed: %s", ticket.number, exc)
             self._park(
@@ -255,22 +267,46 @@ class Orchestrator:
         self._ensure_labels()
         records: list[RunRecord] = []
         spent = 0.0
-        for ticket in tickets:
-            if max_tickets is not None and len(records) >= max_tickets:
-                self.log.info("reached max-tickets=%d; stopping", max_tickets)
-                break
-            if spent >= self.config.budget.global_cap_usd:
-                self.log.info(
-                    "global cap $%g reached (spent $%.2f); stopping",
-                    self.config.budget.global_cap_usd,
-                    spent,
-                )
-                break
-            record = self.process_ticket(ticket)
-            records.append(record)
-            spent += record.actual_cost
+        try:
+            for ticket in tickets:
+                if max_tickets is not None and len(records) >= max_tickets:
+                    self.log.info("reached max-tickets=%d; stopping", max_tickets)
+                    break
+                if spent >= self.config.budget.global_cap_usd:
+                    self.log.info(
+                        "global cap $%g reached (spent $%.2f); stopping",
+                        self.config.budget.global_cap_usd,
+                        spent,
+                    )
+                    break
+                record = self.process_ticket(ticket)
+                records.append(record)
+                spent += record.actual_cost
+        except HarnessRateLimited as exc:
+            self._on_rate_limit(exc)
+            raise
         self.log.info("processed %d ticket(s); spent ~$%.2f", len(records), spent)
         return records
+
+    def _on_rate_limit(self, exc: HarnessRateLimited) -> None:
+        """Persist the reset time and emit a marker the bash listener parses."""
+        iso = datetime.fromtimestamp(exc.reset_at).isoformat(timespec="seconds")
+        self.log.warning("harness rate-limited; resets at %s — %s", iso, exc.reset_human[:120])
+        try:
+            os.makedirs(os.path.dirname(RATE_LIMIT_STATE) or ".", exist_ok=True)
+            with open(RATE_LIMIT_STATE, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "reset_epoch": exc.reset_at,
+                        "reset_at": iso,
+                        "reason": exc.reset_human[:300],
+                    },
+                    fh,
+                )
+        except OSError as err:
+            self.log.warning("could not write rate-limit state: %s", err)
+        # Machine-readable line for idle-listener.sh (it also reads the state file).
+        print(f'IDLE_LOOP_RATE_LIMITED reset_epoch={exc.reset_at:.0f} reset_at="{iso}"', flush=True)
 
     def _dry_run_band(self, ticket: Ticket) -> str:
         if not ticket.acceptance_criteria:
@@ -464,8 +500,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     config = load_config(args.config)
     orch = Orchestrator.from_config(config, repo_dir=args.repo_dir)
-    orch.run(max_tickets=args.max_tickets, dry_run=args.dry_run)
-    return 0
+    try:
+        orch.run(max_tickets=args.max_tickets, dry_run=args.dry_run)
+    except HarnessRateLimited:
+        # State + marker already emitted by Orchestrator._on_rate_limit.
+        return EXIT_RATE_LIMITED
+    return EXIT_OK
 
 
 if __name__ == "__main__":
