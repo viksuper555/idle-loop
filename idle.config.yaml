@@ -3,6 +3,15 @@ repo: "viksuper555/idle-loop"
 model: "claude-opus-4-8"          # the coding agent model
 cost_log_path: "cost_log.jsonl"
 
+# Working-memory mode between an agent's turns/runs:
+#   false -> RESUME: continue the prior claude session via --resume. Warm context,
+#            but machine-local (the transcript can't move between machines).
+#   true  -> PROGRESS: author/commit a portable PROGRESS.md and feed it into every
+#            prompt instead of resuming, so a cold start on ANY machine can
+#            continue from committed git state alone. (Pairs with a pre-merge
+#            PROGRESS.md strip — see the epic — to keep the note off the base branch.)
+progress_memory: false
+
 labels:
   ready: "idle:ready"
   needs_human: "idle:needs-human"

@@ -144,6 +144,14 @@ class Config:
     repo: str = ""
     model: str = "claude-opus-4-8"
     cost_log_path: str = "cost_log.jsonl"
+    # Working-memory mode for the implementer between turns/runs:
+    #   False (default) -> RESUME: continue the prior claude session via --resume.
+    #       Fast (warm context) but machine-local — the transcript can't move
+    #       between machines, so cross-PC handoff is impossible.
+    #   True -> PROGRESS: author and commit a portable PROGRESS.md and feed it into
+    #       every prompt INSTEAD of resuming, so a cold start on any machine can
+    #       continue from committed git state alone. No --resume in this mode.
+    progress_memory: bool = False
     labels: Labels = field(default_factory=Labels)
     triage: Triage = field(default_factory=Triage)
     budget: Budget = field(default_factory=Budget)
@@ -186,6 +194,7 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> Config:
         repo=raw.get("repo", ""),
         model=raw.get("model", Config.model),
         cost_log_path=raw.get("cost_log_path", Config.cost_log_path),
+        progress_memory=bool(raw.get("progress_memory", Config.progress_memory)),
     )
     if isinstance(raw.get("labels"), dict):
         cfg.labels = _build(Labels, raw["labels"])

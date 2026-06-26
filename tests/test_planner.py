@@ -42,9 +42,9 @@ def ticket():
     return Ticket(number=1, title="t", body="b", acceptance_criteria=["a", "b"])
 
 
-def planner(text="", session_id="sess-1", raises=None):
+def planner(text="", session_id="sess-1", raises=None, progress=False):
     h = FakeHarness(text=text, session_id=session_id, raises=raises)
-    return Planner(Config(repo="o/n"), harness=h), h
+    return Planner(Config(repo="o/n", progress_memory=progress), harness=h), h
 
 
 def _budget_json(ein=1_000_000, eout=200_000):
@@ -104,6 +104,41 @@ def test_seeds_session_file_for_implementer_resume(tmp_path):
     p.plan(ticket(), str(tmp_path))
     assert load_session(str(tmp_path)) == "sess-plan"
     assert (tmp_path / ".idle-loop" / "session").read_text(encoding="utf-8") == "sess-plan"
+
+
+def test_seeds_first_progress_from_plan(tmp_path):
+    # The planner authors the first PROGRESS.md so the implementer's portable
+    # memory exists from turn one, carrying the plan as the current approach.
+    from agents.implementer import load_progress
+
+    p, _ = planner(_budget_json(), progress=True)
+    res = p.plan(ticket(), str(tmp_path))
+    assert res is not None
+    body = load_progress(str(tmp_path))
+    assert body is not None
+    assert "## Current approach" in body
+    assert "do the thing" in body  # the plan text from _budget_json
+    # Prose only — never a raw token-budget dump.
+    assert "estimated_input_tokens" not in body
+
+
+def test_no_progress_seeded_when_unparseable(tmp_path):
+    from agents.implementer import load_progress
+
+    p, _ = planner("no json here", progress=True)
+    assert p.plan(ticket(), str(tmp_path)) is None
+    assert load_progress(str(tmp_path)) is None  # unparseable -> no plan -> no seed
+
+
+def test_no_progress_seeded_in_resume_mode(tmp_path):
+    # In RESUME mode (default) the planner authors no PROGRESS.md — the implementer
+    # resumes the planning session instead. The session id is still saved.
+    from agents.implementer import load_progress, load_session
+
+    p, _ = planner(_budget_json(), session_id="sess-r")  # progress=False (default)
+    assert p.plan(ticket(), str(tmp_path)) is not None
+    assert load_progress(str(tmp_path)) is None
+    assert load_session(str(tmp_path)) == "sess-r"
 
 
 def test_seeds_session_even_when_unparseable(tmp_path):

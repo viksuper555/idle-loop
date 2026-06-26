@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from agents.harness import ClaudeHarness
-from agents.implementer import save_session
+from agents.implementer import save_session, write_progress
 from agents.reviewer import _extract_json
 from config import Config
 from models import Ticket
@@ -79,6 +79,25 @@ class Planner:
         self.config = config
         self.harness = harness or ClaudeHarness(config)
 
+    @staticmethod
+    def _seed_progress(ticket: Ticket, plan_text: str) -> str:
+        """Render the first PROGRESS.md entry from the plan (prose only)."""
+        approach = plan_text or "See the ticket's acceptance criteria."
+        return (
+            f"# Progress — #{ticket.number}: {ticket.title}\n\n"
+            "## Done\n"
+            "Planning pass complete; implementation not started.\n\n"
+            "## Remaining\n"
+            "Implement the ticket and satisfy every acceptance criterion with "
+            "passing tests.\n\n"
+            "## Current approach\n"
+            f"{approach}\n\n"
+            "## Files touched\n"
+            "- (none yet)\n\n"
+            "## Last reviewer asks\n"
+            "(none — no reviewer feedback yet)\n"
+        )
+
     def _build_prompt(self, ticket: Ticket) -> str:
         criteria = ticket.acceptance_criteria or []
         ac = "\n".join(f"- {c}" for c in criteria) if criteria else "(none listed)"
@@ -123,6 +142,13 @@ class Planner:
             if isinstance(raw_files, list)
             else []
         )
+
+        # In PROGRESS mode, seed the first PROGRESS.md from the plan so the
+        # implementer's portable memory exists from the first turn (prose only).
+        # In RESUME mode the implementer resumes this planning session instead.
+        if self.config.progress_memory:
+            plan_text = str(data.get("plan", "")).strip()
+            write_progress(repo_dir, self._seed_progress(ticket, plan_text))
 
         return PlanResult(
             estimated_input_tokens=est_in,
