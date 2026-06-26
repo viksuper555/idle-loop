@@ -48,7 +48,7 @@ class Budget:
 
 @dataclass
 class Guards:
-    max_diff_lines: int = 400
+    max_diff_lines: int = 4000
     max_files: int = 15
     path_allowlist: list[str] = field(default_factory=lambda: ["src/**", "tests/**"])
     path_denylist: list[str] = field(

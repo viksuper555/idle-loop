@@ -26,6 +26,8 @@ import urllib.parse
 from collections.abc import Sequence
 from datetime import datetime
 
+import naming
+import pr_template
 from agents.harness import HarnessRateLimited
 from config import Config, load_config
 from costlog import append_record
@@ -222,16 +224,21 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     # Per-ticket processing (SPEC steps 2-9)
     # ------------------------------------------------------------------ #
-    def process_ticket(self, ticket: Ticket, repo_dir: str | None = None) -> RunRecord:
+    def process_ticket(
+        self, ticket: Ticket, repo_dir: str | None = None, branch: str | None = None
+    ) -> RunRecord:
         """Process one ticket end-to-end. Never raises (except rate-limit).
 
         ``repo_dir`` is the working tree the implementer commits in; it defaults
         to the orchestrator's own checkout, but is overridden with a per-ticket
-        git worktree when tickets are worked in parallel.
+        git worktree when tickets are worked in parallel. ``branch`` is the head
+        branch to implement on; when omitted it is derived from the ticket (see
+        :meth:`_branch_for`) — the parallel path passes it explicitly so the
+        worktree and branch are named consistently.
         """
         repo_dir = repo_dir or self.repo_dir
         try:
-            return self._process_ticket(ticket, repo_dir)
+            return self._process_ticket(ticket, repo_dir, branch)
         except HarnessRateLimited:
             raise  # stop the whole loop; the listener will reschedule
         except Exception as exc:  # noqa: BLE001 - one bad ticket must not kill the loop
@@ -242,7 +249,9 @@ class Orchestrator:
             )
             return self._record(ticket, None, None, Outcome.FAILED)
 
-    def _process_ticket(self, ticket: Ticket, repo_dir: str) -> RunRecord:
+    def _process_ticket(
+        self, ticket: Ticket, repo_dir: str, branch: str | None = None
+    ) -> RunRecord:
         labels = self.config.labels
 
         # (1) Reject tickets without acceptance criteria — never guess (SPEC §4).
@@ -285,8 +294,9 @@ class Orchestrator:
             self._label(ticket, labels.needs_human)
             return self._record(ticket, estimate, None, Outcome.SKIPPED)
 
-        # (4) Implement on a fresh isolated branch.
-        branch = f"idle/issue-{ticket.number}"
+        # (4) Implement on a fresh isolated branch (named <prefix>/issue-<id>).
+        if branch is None:
+            branch = self._branch_for(ticket)
         self.log.info("#%s implementing on %s", ticket.number, branch)
         impl = self.implementer.run(ticket, repo_dir, branch)
         self.log.info(
@@ -327,7 +337,7 @@ class Orchestrator:
             return self._record(ticket, estimate, impl, outcome)
 
         # (6) Push the branch and open the PR linking the issue.
-        pr = self._open_pr(ticket, branch, impl, results, repo_dir)
+        pr = self._open_pr(ticket, branch, impl, results, estimate, repo_dir)
         if pr is None:
             self.log.info("#%s could not push branch / open PR; parking", ticket.number)
             self._park(
@@ -527,9 +537,11 @@ class Orchestrator:
         def work(ticket: Ticket) -> RunRecord:
             # The worktree persists after the pass — it is reclaimed only once
             # the ticket's PR is merged/closed (see _reap_worktrees), so work can
-            # resume in it (with saved agent context) on a later run.
-            worktree = self._make_worktree(ticket)
-            return self.process_ticket(ticket, repo_dir=worktree)
+            # resume in it (with saved agent context) on a later run. The branch
+            # and worktree are named from the same scheme so they stay in sync.
+            branch = self._branch_for(ticket)
+            worktree = self._make_worktree(ticket, branch)
+            return self.process_ticket(ticket, repo_dir=worktree, branch=branch)
 
         records: list[RunRecord] = []
         spent = 0.0
@@ -589,18 +601,36 @@ class Orchestrator:
             timeout=120,
         )
 
-    def _worktree_path(self, number: int) -> str:
-        return os.path.join(self.repo_dir, WORKTREE_DIR, f"issue-{number}")
+    def _worktree_path(self, branch: str) -> str:
+        """The worktree directory for ``branch`` (its name flattened, see naming)."""
+        return os.path.join(self.repo_dir, WORKTREE_DIR, naming.worktree_dir_name(branch))
 
-    def _make_worktree(self, ticket: Ticket) -> str:
-        """Return an isolated git worktree for ``ticket``, creating it if needed.
+    def _branch_exists(self, name: str) -> bool:
+        """Whether ``name`` is already a local git head (worktrees share refs)."""
+        proc = self._worktree_git("rev-parse", "--verify", "--quiet", f"refs/heads/{name}")
+        return proc.returncode == 0
 
-        An existing worktree for the ticket is reused as-is — its branch and the
-        agent's prior work are preserved so the implementer continues where it
-        left off. A new worktree is checked out (detached) at the target branch
-        so the implementer's own ``checkout -b idle/issue-N`` starts clean.
+    def _branch_for(self, ticket: Ticket) -> str:
+        """The branch to implement ``ticket`` on: ``<prefix>/issue-<id>``.
+
+        Reuses the canonical name when a worktree for it already exists (we are
+        resuming that effort); otherwise dedupes against existing local heads so
+        a name already taken by unrelated work gets a ``-b``/``-c`` suffix.
         """
-        path = self._worktree_path(ticket.number)
+        canonical = naming.canonical_branch(ticket)
+        if os.path.isdir(self._worktree_path(canonical)):
+            return canonical
+        return naming.dedupe_branch(canonical, self._branch_exists)
+
+    def _make_worktree(self, ticket: Ticket, branch: str) -> str:
+        """Return an isolated git worktree for ``branch``, creating it if needed.
+
+        An existing worktree is reused as-is — its branch and the agent's prior
+        work are preserved so the implementer continues where it left off. A new
+        worktree is checked out (detached) at the target branch so the
+        implementer's own ``checkout -b <prefix>/issue-N`` starts clean.
+        """
+        path = self._worktree_path(branch)
         if os.path.isdir(path):
             self.log.info("#%s reusing worktree %s", ticket.number, path)
             return path
@@ -629,20 +659,16 @@ class Orchestrator:
         if not os.path.isdir(root):
             return
         for name in sorted(os.listdir(root)):
-            if not name.startswith("issue-"):
+            branch = naming.branch_from_worktree_dir(name)
+            if branch is None:
                 continue
-            try:
-                number = int(name[len("issue-"):])
-            except ValueError:
-                continue
-            branch = f"idle/issue-{number}"
             try:
                 status = self.github.pr_status_for_branch(branch)
             except GitHubError as exc:
                 self.log.warning("reap: PR status for %s failed: %s", branch, exc)
                 continue
             if status == "done":
-                self.log.info("#%s PR merged/closed — reclaiming worktree", number)
+                self.log.info("%s PR merged/closed — reclaiming worktree", branch)
                 self._remove_worktree(os.path.join(root, name))
 
     def _on_rate_limit(self, exc: HarnessRateLimited) -> None:
@@ -740,6 +766,7 @@ class Orchestrator:
         branch: str,
         impl: ImplementationResult,
         results: list[GuardResult],
+        estimate: EstimateResult | None = None,
         repo_dir: str | None = None,
     ) -> dict | None:
         # Push the implementation branch first — GitHub can't open a PR for a
@@ -747,15 +774,7 @@ class Orchestrator:
         if not self.implementer.push_branch(repo_dir or self.repo_dir, branch):
             self.log.warning("#%s push of branch %s failed", ticket.number, branch)
             return None
-        body = (
-            f"Closes #{ticket.number}\n\n"
-            f"Automated implementation by **idle-loop**.\n\n"
-            f"**Files changed:** {len(impl.files_changed)} | "
-            f"**Iterations:** {impl.iterations} | "
-            f"**Actual cost:** ${impl.cost_usd:.2f}\n\n"
-            f"{_gates_summary(results)}\n\n"
-            f"{SHIPPED_BY}"
-        )
+        body = pr_template.render_pr_body(self._pr_content(ticket, branch, impl, results, estimate))
         try:
             pr = self.github.create_pull_request(
                 title=f"[idle-loop] {ticket.title} (#{ticket.number})",
@@ -768,6 +787,35 @@ class Orchestrator:
         except GitHubError as exc:
             self.log.warning("create_pull_request for #%s failed: %s", ticket.number, exc)
             return None
+
+    def _pr_content(
+        self,
+        ticket: Ticket,
+        branch: str,
+        impl: ImplementationResult,
+        results: list[GuardResult],
+        estimate: EstimateResult | None,
+    ) -> pr_template.PRContent:
+        """Assemble the PR body inputs from a finished implementation."""
+        badges = ""
+        if estimate is not None:
+            badges = _cost_badges(
+                estimate,
+                spent=impl.cost_usd,
+                spent_tokens=impl.input_tokens + impl.output_tokens,
+            )
+        return pr_template.PRContent(
+            issue_number=ticket.number,
+            title=ticket.title,
+            branch=branch,
+            issue_url=ticket.url,
+            acceptance_criteria=list(ticket.acceptance_criteria),
+            files_changed=len(impl.files_changed),
+            iterations=impl.iterations,
+            cost_badges_md=badges,
+            gates_md=_gates_summary(results),
+            commentary=impl.notes,
+        )
 
     def _merge(self, pr: dict | None) -> bool:
         if not pr:
@@ -929,17 +977,13 @@ class Orchestrator:
             self.log.warning("get_pull_request #%s failed: %s", number, exc)
             return None
         branch = pr.get("head_branch", "")
-        prefix = "idle/issue-"
-        if not branch.startswith(prefix):
+        issue = naming.issue_number_from_branch(branch)
+        if issue is None:
             self.log.info("#PR%s head %r not idle-owned; skipping", number, branch)
-            return None
-        try:
-            issue = int(branch[len(prefix):])
-        except ValueError:
             return None
         from agents.implementer import load_session
 
-        worktree = self._worktree_path(issue)
+        worktree = self._worktree_path(branch)
         return {
             "issue": issue,
             "branch": branch,
@@ -1094,15 +1138,15 @@ def _shield_url(label: str, message: str, color: str) -> str:
     return f"https://img.shields.io/badge/{enc(label)}-{enc(message)}-{color}"
 
 
-def _cost_chip_body(
+def _cost_badges(
     estimate: EstimateResult, spent: float | None, spent_tokens: int | None = None
 ) -> str:
-    """Render the sticky cost-chip body: a cost badge and a sibling tokens badge.
+    """Render the cost/token shields block: a cost badge and a sibling tokens badge.
 
     Before any spend each badge shows its estimate; once an iteration completes
     they show ``spent / estimate``. The token estimate is the planning pass's
     budget and reads ``n/a`` when the estimate fell back to the dollar-only
-    heuristic (carries ``COST_CHIP_MARKER``).
+    heuristic. Shared by the sticky issue chip and the PR body.
     """
     band = estimate.band()
     est_tokens = estimate.estimated_tokens
@@ -1131,11 +1175,17 @@ def _cost_chip_body(
     tok_url = _shield_url("idle-loop tokens", tok_msg, tok_color)
 
     return (
-        f"{COST_CHIP_MARKER}\n"
         f"![idle-loop cost]({cost_url})\n"
         f"![idle-loop tokens]({tok_url})\n\n"
         f"{cost_caption} · {tok_caption}"
     )
+
+
+def _cost_chip_body(
+    estimate: EstimateResult, spent: float | None, spent_tokens: int | None = None
+) -> str:
+    """The sticky cost-chip comment body: the marker plus the cost/token badges."""
+    return f"{COST_CHIP_MARKER}\n{_cost_badges(estimate, spent, spent_tokens)}"
 
 
 def _gates_summary(results: list[GuardResult]) -> str:
