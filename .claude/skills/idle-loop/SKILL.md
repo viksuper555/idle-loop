@@ -26,7 +26,27 @@ the **manual / interactive** front door; the unattended path is
    - the target repo has issues labeled `idle:ready`, each with an
      `## Acceptance Criteria` checklist (tickets without criteria are rejected).
 3. Ask the user which they want if it isn't explicit: **estimate only**, **sync
-   labels**, **work N tickets**, or **start watching**.
+   labels**, **work N tickets**, or **start watching**. Ask via the GitHub
+   checkbox protocol below — not the in-terminal prompt.
+
+## Asking the user — via GitHub, not the terminal
+
+The user operates this loop through GitHub, not the Claude Code terminal. So
+**every** decision you'd otherwise raise with `AskUserQuestion` is instead posted
+as a GitHub issue comment with task-list checkboxes, and you read the answer back
+from the ticked box.
+
+1. Post a comment on the relevant `idle:ready` issue (the one in question; if the
+   choice is board-wide, use the lowest-numbered ready issue). One option per
+   `- [ ]` line, an instruction to tick exactly one, and any caveats below a `---`.
+2. Poll the comment until a box flips to `- [x]`:
+   `gh api repos/<repo>/issues/comments/<id> --jq .body`. Run it in the background
+   so the session stays responsive, with a **backoff cadence**: every 30s for the
+   first 10 min, then every 1 min until 30 min, then every 5 min thereafter (cap
+   ~2 h).
+3. Act on the ticked option. If the window times out with nothing ticked, say so
+   and re-post or wait — don't assume a default.
+4. Only fall back to an in-terminal prompt if GitHub is unreachable (`gh` errors).
 
 ## Commands (run from the repo root)
 
