@@ -24,10 +24,26 @@ _SYSTEM = (
     "isolated git branch inside the current working directory. Read the ticket "
     "and its acceptance criteria, plan briefly, then implement the change. WRITE "
     "AND UPDATE TESTS as you go — every new behavior needs a test, and run the "
-    "suite to confirm it passes. Stay strictly within the scope allowlist given; "
-    "never touch files outside it, and never edit secrets, CI config, infra, or "
-    "database migrations. Commit your work on the current branch. When the "
+    "suite to confirm it passes. Commit your work on the current branch. When the "
     "acceptance criteria are met and tests pass, stop."
+)
+
+# Appended when the ticket is NOT labelled allow-sensitive: a hard ban on
+# touching sensitive paths.
+_DENY_SENSITIVE = (
+    "Do NOT edit secrets, CI config, infrastructure, or database migrations. If "
+    "the ticket appears to require such a change, stop and leave it for a human."
+)
+
+# Appended when the ticket IS labelled allow-sensitive: the sensitive paths are
+# explicitly in scope for this ticket (they are otherwise denylisted, so the
+# implementer would refuse them by default — and they sit outside the allowlist,
+# so they must be named here for the agent to touch them).
+_ALLOW_SENSITIVE = (
+    "This ticket is labelled allow-sensitive: editing otherwise-sensitive paths "
+    "(CI config, infra, migrations) IS permitted where the acceptance criteria "
+    "require it. The following globs are in scope for this ticket even though "
+    "they normally are not: {deny}. Touch them only when a criterion needs it."
 )
 
 
@@ -94,26 +110,54 @@ class Implementer:
     # ------------------------------------------------------------------ #
     # Prompt
     # ------------------------------------------------------------------ #
-    def _prompt(self, ticket: Ticket) -> str:
+    def _allow_sensitive(self, ticket: Ticket) -> bool:
+        return ticket.has_label(self.config.labels.allow_sensitive)
+
+    def _prompt(self, ticket: Ticket, feedback: str | None = None) -> str:
         criteria = ticket.acceptance_criteria or []
         ac = "\n".join(f"- {c}" for c in criteria) if criteria else "(none listed)"
         allow = ", ".join(self.config.guards.path_allowlist) or "(none)"
-        return (
-            f"{_SYSTEM}\n\n"
-            f"--- TICKET #{ticket.number}: {ticket.title} ---\n"
-            f"{ticket.body}\n\n"
-            f"Acceptance criteria:\n{ac}\n\n"
-            f"Scope allowlist (only touch paths matching these globs): {allow}\n"
-        )
+        if self._allow_sensitive(ticket):
+            deny = ", ".join(self.config.guards.path_denylist) or "(none)"
+            scope_rule = _ALLOW_SENSITIVE.format(deny=deny)
+        else:
+            scope_rule = _DENY_SENSITIVE
+        parts = [
+            _SYSTEM,
+            f"--- TICKET #{ticket.number}: {ticket.title} ---\n{ticket.body}",
+            f"Acceptance criteria:\n{ac}",
+            f"Scope allowlist (primary paths you may touch): {allow}",
+            scope_rule,
+        ]
+        if feedback:
+            parts.append(
+                "--- A REVIEWER REQUESTED CHANGES on your previous attempt ---\n"
+                f"{feedback}\n\n"
+                "Address every point above by REVISING your existing work on this "
+                "branch — do not start over or revert. When all points are resolved "
+                "and tests pass, stop."
+            )
+        return "\n\n".join(parts) + "\n"
 
     # ------------------------------------------------------------------ #
     # Entry point
     # ------------------------------------------------------------------ #
-    def run(self, ticket: Ticket, repo_dir: str, branch: str) -> ImplementationResult:
-        """Implement ``ticket`` on ``branch`` via the harness; read back the diff."""
+    def run(
+        self,
+        ticket: Ticket,
+        repo_dir: str,
+        branch: str,
+        feedback: str | None = None,
+    ) -> ImplementationResult:
+        """Implement ``ticket`` on ``branch`` via the harness; read back the diff.
+
+        When ``feedback`` is given, the implementer revises its existing work on
+        the same branch to address a reviewer's requested changes rather than
+        starting a fresh implementation.
+        """
         try:
             self._start_branch(repo_dir, branch)
-            result = self.harness.run(self._prompt(ticket), cwd=repo_dir)
+            result = self.harness.run(self._prompt(ticket, feedback), cwd=repo_dir)
         except HarnessRateLimited:
             raise  # propagate so the loop stops and the listener reschedules
         except Exception as exc:  # noqa: BLE001 - return a failed result, never raise

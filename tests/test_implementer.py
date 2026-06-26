@@ -85,6 +85,46 @@ def test_harness_error_becomes_failed_result(monkeypatch, tmp_path):
     assert res.error and res.branch == "idle/issue-1"
 
 
+def test_prompt_denies_sensitive_paths_by_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    harness = FakeHarness()
+    cfg = Config(repo="o/n")
+    impl = Implementer(cfg, harness=harness)
+    impl.run(ticket(1), str(tmp_path), "idle/issue-1")
+    prompt = harness.calls[0]["prompt"]
+    assert "never edit secrets, ci config" in prompt.lower() or "do not edit secrets" in prompt.lower()
+    # Without the label, denylisted globs are NOT advertised as in-scope.
+    assert ".github/**" not in prompt
+
+
+def test_prompt_unlocks_denylist_when_allow_sensitive(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    harness = FakeHarness()
+    cfg = Config(repo="o/n")
+    t = Ticket(
+        number=3,
+        title="Remove label job",
+        body="b",
+        labels=[cfg.labels.ready, cfg.labels.allow_sensitive],
+        acceptance_criteria=["remove the job"],
+    )
+    Implementer(cfg, harness=harness).run(t, str(tmp_path), "idle/issue-3")
+    prompt = harness.calls[0]["prompt"]
+    assert "allow-sensitive" in prompt.lower()
+    # The otherwise-denylisted paths are named as in-scope for this ticket.
+    assert ".github/**" in prompt
+
+
+def test_prompt_includes_reviewer_feedback_on_revision(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    harness = FakeHarness()
+    impl = Implementer(Config(repo="o/n"), harness=harness)
+    impl.run(ticket(1), str(tmp_path), "idle/issue-1", feedback="- file.py:1: cover the Y case")
+    prompt = harness.calls[0]["prompt"]
+    assert "reviewer requested changes" in prompt.lower()
+    assert "cover the Y case" in prompt
+
+
 def test_safe_path_rejects_traversal(tmp_path):
     impl = Implementer(Config(repo="o/n"), harness=FakeHarness())
     assert str(impl._safe_path(str(tmp_path), "src/x.py")).startswith(str(tmp_path.resolve()))
