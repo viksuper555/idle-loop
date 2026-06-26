@@ -224,8 +224,16 @@ class Orchestrator:
             )
             return self._record(ticket, estimate, impl, outcome)
 
-        # (6) Open the PR linking the issue and summarizing the change.
+        # (6) Push the branch and open the PR linking the issue.
         pr = self._open_pr(ticket, branch, impl, results)
+        if pr is None:
+            self.log.info("#%s could not push branch / open PR; parking", ticket.number)
+            self._park(
+                ticket,
+                "idle-loop implemented the change but could not push the branch or "
+                f"open a PR (branch `{branch}`). Check the loop's git remote/permissions.",
+            )
+            return self._record(ticket, estimate, impl, Outcome.PARKED)
 
         # (7) Review against the acceptance criteria (separate agent/context).
         verdict = self.reviewer.review(ticket, impl.diff)
@@ -350,6 +358,11 @@ class Orchestrator:
         impl: ImplementationResult,
         results: list[GuardResult],
     ) -> dict | None:
+        # Push the implementation branch first — GitHub can't open a PR for a
+        # head ref that only exists locally.
+        if not self.implementer.push_branch(self.repo_dir, branch):
+            self.log.warning("#%s push of branch %s failed", ticket.number, branch)
+            return None
         body = (
             f"Closes #{ticket.number}\n\n"
             f"Automated implementation by **idle-loop**.\n\n"

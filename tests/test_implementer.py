@@ -30,8 +30,10 @@ class FakeHarness:
         return self.result
 
 
-def fake_git(diff="+added\n", names="src/feature.py\n", checkout_rc=0):
+def fake_git(diff="+added\n", names="src/feature.py\n", checkout_rc=0, push_rc=0):
     def run(cmd, *args, **kwargs):
+        if "push" in cmd:
+            return subprocess.CompletedProcess(cmd, push_rc, stdout="", stderr="")
         if "--name-only" in cmd:
             out = names
         elif "diff" in cmd:
@@ -88,3 +90,11 @@ def test_safe_path_rejects_traversal(tmp_path):
     assert str(impl._safe_path(str(tmp_path), "src/x.py")).startswith(str(tmp_path.resolve()))
     with pytest.raises(ValueError):
         impl._safe_path(str(tmp_path), "../escape.py")
+
+
+def test_push_branch(monkeypatch, tmp_path):
+    impl = Implementer(Config(repo="o/n"), harness=FakeHarness())
+    monkeypatch.setattr(subprocess, "run", fake_git(push_rc=0))
+    assert impl.push_branch(str(tmp_path), "idle/issue-1") is True
+    monkeypatch.setattr(subprocess, "run", fake_git(push_rc=1))
+    assert impl.push_branch(str(tmp_path), "idle/issue-1") is False

@@ -64,6 +64,15 @@ class Implementer:
         if proc.returncode != 0:
             self._git(repo_dir, "checkout", branch)
 
+    def push_branch(self, repo_dir: str, branch: str) -> bool:
+        """Push the implementation branch to origin so a PR can be opened.
+
+        Uses ``--force-with-lease`` so a re-run of ``idle/issue-N`` updates the
+        remote branch safely rather than failing on a stale ref.
+        """
+        proc = self._git(repo_dir, "push", "--force-with-lease", "-u", "origin", branch)
+        return proc.returncode == 0
+
     def _diff(self, repo_dir: str, base: str) -> str:
         for args in (("diff", f"{base}...HEAD"), ("diff", "HEAD"), ("diff",)):
             proc = self._git(repo_dir, *args)

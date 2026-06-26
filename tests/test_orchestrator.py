@@ -70,9 +70,15 @@ class FakeGitHub:
 
 
 class FakeImplementer:
-    def __init__(self, result: ImplementationResult):
+    def __init__(self, result: ImplementationResult, push_ok: bool = True):
         self.result = result
+        self.push_ok = push_ok
         self.calls: list[tuple[int, str, str]] = []
+        self.pushed: list[tuple[str, str]] = []
+
+    def push_branch(self, repo_dir: str, branch: str) -> bool:
+        self.pushed.append((repo_dir, branch))
+        return self.push_ok
 
     def run(self, ticket: Ticket, repo_dir: str, branch: str) -> ImplementationResult:
         self.calls.append((ticket.number, repo_dir, branch))
@@ -363,3 +369,25 @@ def test_ensure_labels_syncs_without_running_loop(monkeypatch):
     assert rc == idle_loop.EXIT_OK
     assert recorded["repo"] == "o/n"
     assert recorded["names"] == ["idle:ready", "idle:needs-human", "idle:allow-sensitive"]
+
+
+def test_branch_pushed_before_pr(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False
+    )
+    orch.process_ticket(ticket(1))
+    # The branch was pushed to origin before the PR was opened.
+    assert implementer.pushed and implementer.pushed[0][1] == "idle/issue-1"
+    assert len(gh.prs) == 1 and gh.merged == [1]
+
+
+def test_failed_push_parks_without_pr(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False
+    )
+    implementer.push_ok = False  # simulate a push failure
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.PARKED
+    assert gh.prs == [] and gh.merged == []  # no PR opened, nothing merged
+    assert reviewer.calls == []  # never reached review
+    assert (1, "idle:needs-human") in gh.added_labels
