@@ -38,6 +38,9 @@ class FakeGitHub:
         self.prs: list[dict] = []
         self.merged: list[int] = []
         self.ensured: list[list[str]] = []
+        # Sticky comments, keyed by (issue number, marker) -> latest body.
+        self.sticky: dict[tuple[int, str], str] = {}
+        self.upsert_calls: list[tuple[int, str, str]] = []
         self._pr_seq = 0
 
     def list_ready_issues(self, label: str) -> list[Ticket]:
@@ -45,6 +48,11 @@ class FakeGitHub:
 
     def comment(self, number: int, body: str) -> None:
         self.comments.append((number, body))
+
+    def upsert_comment(self, number: int, marker: str, body: str) -> None:
+        # Mirror GitHubClient.upsert_comment: one sticky comment per marker.
+        self.upsert_calls.append((number, marker, body))
+        self.sticky[(number, marker)] = body
 
     def add_label(self, number: int, label: str) -> None:
         self.added_labels.append((number, label))
@@ -501,6 +509,67 @@ def test_ensure_labels_syncs_without_running_loop(monkeypatch):
     assert rc == idle_loop.EXIT_OK
     assert recorded["repo"] == "o/n"
     assert recorded["names"] == ["idle:ready", "idle:needs-human", "idle:allow-sensitive"]
+
+
+def test_cost_chip_posted_on_estimate_then_updated_with_spend(tmp_path):
+    # The chip is a sticky comment: first the estimate, then the running cost.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=False
+    )
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.MERGED
+
+    key = (1, idle_loop.COST_CHIP_MARKER)
+    # Exactly one sticky chip survives (upserted in place, not duplicated).
+    assert key in gh.sticky
+    # First upsert was the estimate; the final body shows actual spend.
+    assert gh.upsert_calls[0][1] == idle_loop.COST_CHIP_MARKER
+    assert "cost estimate" in gh.upsert_calls[0][2]
+    final = gh.sticky[key]
+    assert "cost so far" in final
+    assert "$10.00" in final  # good_impl() costs $10
+    assert "img.shields.io" in final  # rendered as a chip/badge
+
+
+def test_cost_chip_posted_even_when_priced_out(tmp_path):
+    # Over the auto threshold: never implemented, but the estimate chip still
+    # surfaces the price on the issue.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], threshold=1.0
+    )
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.SKIPPED
+    body = gh.sticky[(1, idle_loop.COST_CHIP_MARKER)]
+    assert "cost estimate" in body and "img.shields.io" in body
+    # No spend was incurred, so no "cost so far" update happened.
+    assert all("cost so far" not in b for _, _, b in gh.upsert_calls)
+
+
+def test_cost_chip_tracks_each_revision(tmp_path):
+    # request_changes then approve: the chip's spend must reflect cumulative cost
+    # across both iterations, updated after each one.
+    reviewer = SequenceReviewer(
+        [
+            ReviewVerdict(Decision.REQUEST_CHANGES, summary="fix"),
+            ReviewVerdict(Decision.APPROVE, summary="ok"),
+        ]
+    )
+    orch, gh, implementer, _ = make_orch(
+        tmp_path, issues=[ticket(1)], impl=good_impl(cost=4.0), require_human=False
+    )
+    orch.reviewer = reviewer
+    orch.process_ticket(ticket(1))
+
+    # Estimate + two iteration updates (initial $4, revision -> $8 total).
+    spend_updates = [b for _, _, b in gh.upsert_calls if "cost so far" in b]
+    assert "$4.00" in spend_updates[0]
+    assert "$8.00" in gh.sticky[(1, idle_loop.COST_CHIP_MARKER)]
+
+
+def test_dry_run_posts_no_cost_chip(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    orch.run(dry_run=True)
+    assert gh.upsert_calls == [] and gh.sticky == {}
 
 
 def test_branch_pushed_before_pr(tmp_path):

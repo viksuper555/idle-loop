@@ -131,6 +131,36 @@ class GitHubClient:
             json={"body": body},
         )
 
+    def list_comments(self, number: int) -> list[dict]:
+        """List the comments on issue ``number`` (each ``{"id", "body", ...}``)."""
+        resp = self._request(
+            "GET",
+            f"/repos/{self.repo}/issues/{number}/comments",
+            params={"per_page": 100},
+        )
+        return resp.json()
+
+    def update_comment(self, comment_id: int, body: str) -> None:
+        """Edit the body of an existing issue comment in place."""
+        self._request(
+            "PATCH",
+            f"/repos/{self.repo}/issues/comments/{comment_id}",
+            json={"body": body},
+        )
+
+    def upsert_comment(self, number: int, marker: str, body: str) -> None:
+        """Create or update a single sticky comment identified by ``marker``.
+
+        Finds the first existing comment whose body contains ``marker`` and edits
+        it in place; otherwise posts ``body`` as a new comment. ``body`` is
+        expected to already carry ``marker`` so future calls can find it.
+        """
+        for comment in self.list_comments(number):
+            if marker in (comment.get("body") or ""):
+                self.update_comment(comment["id"], body)
+                return
+        self.comment(number, body)
+
     def add_label(self, number: int, label: str) -> None:
         """Add ``label`` to issue ``number``."""
         self._request(
