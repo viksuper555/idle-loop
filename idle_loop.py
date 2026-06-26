@@ -21,6 +21,7 @@ import logging
 import os
 import subprocess
 import sys
+import urllib.parse
 from collections.abc import Sequence
 from datetime import datetime
 
@@ -47,6 +48,10 @@ from models import (
 log = logging.getLogger("idle_loop")
 
 SHIPPED_BY = "🤖 _Shipped by [idle-loop](https://github.com/viksuper555/idle-loop)._"
+
+# Marker on the single sticky "cost chip" comment idle-loop maintains per issue,
+# so a human watching the board sees the price without digging into the logs.
+COST_CHIP_MARKER = "<!-- idle-loop:cost-chip -->"
 
 # Exit codes the bash listener keys on.
 EXIT_OK = 0
@@ -176,6 +181,8 @@ class Orchestrator:
             estimate.estimated_iterations,
             estimate.confidence,
         )
+        # Surface the price on the issue itself as a chip the moment it's known.
+        self._cost_chip(ticket, estimate)
 
         # (3) Triage — park anything over the auto threshold before any tokens.
         threshold = self.config.triage.auto_threshold_usd
@@ -202,6 +209,8 @@ class Orchestrator:
             impl.cost_usd,
             " [error]" if impl.error else "",
         )
+        # Iteration done — refresh the chip with the running actual cost.
+        self._cost_chip(ticket, estimate, spent=impl.cost_usd)
 
         # (5) Guards — fail closed, in order.
         ctx = GuardContext(
@@ -273,6 +282,8 @@ class Orchestrator:
                 total_cost,
                 " [error]" if impl.error else "",
             )
+            # Iteration done — refresh the chip with the cumulative spend.
+            self._cost_chip(ticket, estimate, spent=total_cost)
 
             # Re-run guards on the revised diff. A failure here (e.g. the revision
             # ballooned past max_diff_lines) parks rather than looping further —
@@ -430,6 +441,24 @@ class Orchestrator:
         self._comment(ticket, f"🅿️ **idle-loop parked this ticket.**\n\n{reason}")
         self._label(ticket, self.config.labels.needs_human)
 
+    def _cost_chip(
+        self,
+        ticket: Ticket,
+        estimate: EstimateResult,
+        spent: float | None = None,
+    ) -> None:
+        """Upsert the sticky cost chip on the issue (estimate, then spend so far).
+
+        Best-effort: a GitHub error here must never derail the loop — the chip is
+        a convenience for humans watching the board, not part of the contract.
+        """
+        try:
+            self.github.upsert_comment(
+                ticket.number, COST_CHIP_MARKER, _cost_chip_body(estimate, spent)
+            )
+        except GitHubError as exc:
+            self.log.warning("cost chip on #%s failed: %s", ticket.number, exc)
+
     def _open_pr(
         self,
         ticket: Ticket,
@@ -514,6 +543,36 @@ class Orchestrator:
 # --------------------------------------------------------------------------- #
 # Formatting helpers
 # --------------------------------------------------------------------------- #
+def _shield_url(label: str, message: str, color: str) -> str:
+    """A shields.io badge URL — a literal pill/chip rendered on the issue.
+
+    Per shields.io's static-badge syntax, literal dashes/underscores in the
+    label or message must be doubled before URL-encoding.
+    """
+    def enc(text: str) -> str:
+        return urllib.parse.quote(text.replace("_", "__").replace("-", "--"), safe="")
+
+    return f"https://img.shields.io/badge/{enc(label)}-{enc(message)}-{color}"
+
+
+def _cost_chip_body(estimate: EstimateResult, spent: float | None) -> str:
+    """Render the sticky cost-chip comment body (carries ``COST_CHIP_MARKER``).
+
+    Before any spend it shows the estimate band; once an iteration completes it
+    shows the running actual cost alongside the original estimate.
+    """
+    band = estimate.band()
+    if spent is None:
+        message = f"est {band}"
+        url = _shield_url("idle-loop cost", message, "blue")
+        caption = f"**idle-loop cost estimate:** {band}"
+    else:
+        message = f"${spent:.2f} spent / est {band}"
+        url = _shield_url("idle-loop cost", message, "brightgreen")
+        caption = f"**idle-loop cost so far:** ${spent:.2f} _(estimate {band})_"
+    return f"{COST_CHIP_MARKER}\n![idle-loop cost]({url})\n\n{caption}"
+
+
 def _gates_summary(results: list[GuardResult]) -> str:
     if not results:
         return "_No guards run._"
