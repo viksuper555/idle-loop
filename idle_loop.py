@@ -489,7 +489,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="process at most N tickets this run",
     )
+    parser.add_argument(
+        "--ensure-labels",
+        action="store_true",
+        help="create/update the idle:* labels on the repo and exit "
+        "(no loop, no harness — needs only a GitHub token)",
+    )
     return parser
+
+
+def ensure_labels(config: Config) -> list[str]:
+    """Create the idle:* labels on the target repo. Returns the label names.
+
+    A standalone, GitHub-token-only action (no agents, no harness) suitable for
+    CI — the only loop side effect that's static and safe to run unattended.
+    """
+    labels = config.labels
+    names = [labels.ready, labels.needs_human, labels.allow_sensitive]
+    GitHubClient(config.repo).ensure_labels(names)
+    log.info("ensured labels on %s: %s", config.repo, ", ".join(names))
+    return names
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -499,6 +518,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     config = load_config(args.config)
+
+    if args.ensure_labels:
+        ensure_labels(config)
+        return EXIT_OK
+
     orch = Orchestrator.from_config(config, repo_dir=args.repo_dir)
     try:
         orch.run(max_tickets=args.max_tickets, dry_run=args.dry_run)

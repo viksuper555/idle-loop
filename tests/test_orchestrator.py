@@ -340,3 +340,26 @@ def test_main_returns_rate_limited_exit_code(tmp_path, monkeypatch):
     )
     rc = idle_loop.main(["--repo-dir", str(tmp_path)])
     assert rc == EXIT_RATE_LIMITED
+
+
+def test_ensure_labels_syncs_without_running_loop(monkeypatch):
+    recorded: dict = {}
+
+    class FakeGH:
+        def __init__(self, repo):
+            recorded["repo"] = repo
+
+        def ensure_labels(self, names):
+            recorded["names"] = list(names)
+
+    def boom_from_config(*a, **k):  # the loop must NOT be constructed
+        raise AssertionError("ensure-labels must not build the orchestrator")
+
+    monkeypatch.setattr(idle_loop, "load_config", lambda p: Config(repo="o/n"))
+    monkeypatch.setattr(idle_loop, "GitHubClient", FakeGH)
+    monkeypatch.setattr(idle_loop.Orchestrator, "from_config", classmethod(boom_from_config))
+
+    rc = idle_loop.main(["--ensure-labels"])
+    assert rc == idle_loop.EXIT_OK
+    assert recorded["repo"] == "o/n"
+    assert recorded["names"] == ["idle:ready", "idle:needs-human", "idle:allow-sensitive"]

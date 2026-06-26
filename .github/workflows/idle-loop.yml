@@ -1,92 +1,54 @@
-# idle-loop — agentic CI/CD.
+# idle-loop CI.
 #
-# The agents run through the Claude Code harness (the `claude` CLI), which is
-# authenticated by a Claude login — NOT an API key. That login isn't available
-# in a default GitHub Actions runner, so:
-#   * schedule — a nightly **dry-run** (estimator + GitHub only; never invokes
-#     the harness), so it's a safe, auth-free "what would the loop cost tonight?"
-#     report.
-#   * workflow_dispatch — manual; a real (non-dry-run) pass needs Claude Code
-#     installed AND authenticated on the runner (e.g. a self-hosted runner that
-#     has run `claude` /login, or a CLAUDE_CODE_OAUTH_TOKEN your setup injects).
-#
-# For real unattended runs, the intended path is the LOCAL listener + cron
-# (./idle-listener.sh), which uses your existing Claude login and reschedules
-# itself across rate limits. See the README.
-#
-# Secret used here:
-#   GH_TOKEN — issues/PRs/labels/merges (a PAT, or the built-in GITHUB_TOKEN;
-#              note the built-in token cannot trigger further workflows on the
-#              PRs it opens).
-name: idle-loop
+# The autonomous loop runs LOCALLY via ./idle-listener.sh — it needs the Claude
+# Code harness (your `claude` login), which a GitHub runner doesn't have. So the
+# only things GitHub Actions is good for here are:
+#   * test   — ruff + pytest on every push / PR (the suite is fully mocked, no
+#              network, no claude).
+#   * labels — create/sync the static idle:* labels on the repo (GitHub token
+#              only; no harness). Runs on manual dispatch and weekly.
+name: idle-loop CI
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "List + estimate only, take no action"
-        type: boolean
-        default: true
-      max_tickets:
-        description: "Process at most N tickets (blank = unlimited)"
-        type: string
-        required: false
-
   schedule:
-    # 03:00 UTC nightly. Scheduled runs are dry-run only (see the run step).
-    - cron: "0 3 * * *"
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC — keep the idle:* labels in sync
 
-# The loop opens PRs, comments, and manages labels.
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-
-concurrency:
-  group: idle-loop
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  run:
+  test:
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install
         run: pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: python -m pytest
 
-      - name: Run idle-loop
+  labels:
+    # Static label sync — manual or weekly. Not run on push/PR.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Ensure idle:* labels
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
-        run: |
-          set -euo pipefail
-          # Scheduled runs are always dry-run; manual runs honor the input.
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            DRY="--dry-run"
-          elif [ "${{ inputs.dry_run }}" = "false" ]; then
-            DRY=""
-          else
-            DRY="--dry-run"
-          fi
-
-          if [ -z "$DRY" ] && ! command -v claude >/dev/null; then
-            echo "::error::A real run needs the Claude Code harness (claude) installed and"
-            echo "::error::authenticated on this runner. Use --dry-run here, or run the local"
-            echo "::error::listener (./idle-listener.sh). See the README."
-            exit 1
-          fi
-
-          MAX=""
-          if [ -n "${{ inputs.max_tickets }}" ]; then
-            MAX="--max-tickets ${{ inputs.max_tickets }}"
-          fi
-
-          echo "Running: python idle_loop.py $DRY $MAX"
-          python idle_loop.py $DRY $MAX
+        run: python idle_loop.py --ensure-labels
