@@ -1,0 +1,9 @@
+[project]
+name = "idle-demo-target"
+version = "0.0.1"
+description = "Tiny target repo for the idle-loop end-to-end demo."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
