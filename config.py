@@ -140,6 +140,28 @@ class Harness:
 
 
 @dataclass
+class Identities:
+    """Per-agent GitHub identities, so each agent comments under its own name.
+
+    ``enabled`` off (default) -> every agent shares the default token, i.e.
+    current behaviour. ``tokens`` maps each logical agent to the env var holding
+    its GitHub App installation token (or a bot PAT); a maintainer provisions
+    those out of band (secrets). An agent whose env var is unset falls back to
+    the shared default.
+    """
+
+    enabled: bool = False
+    tokens: dict[str, str] = field(
+        default_factory=lambda: {
+            "planner": "IDLE_GH_TOKEN_PLANNER",
+            "implementer": "IDLE_GH_TOKEN_IMPLEMENTER",
+            "reviewer": "IDLE_GH_TOKEN_REVIEWER",
+            "loop": "IDLE_GH_TOKEN_LOOP",
+        }
+    )
+
+
+@dataclass
 class Config:
     repo: str = ""
     model: str = "claude-opus-4-8"
@@ -161,6 +183,7 @@ class Config:
     estimator: Estimator = field(default_factory=Estimator)
     planner: Planner = field(default_factory=Planner)
     harness: Harness = field(default_factory=Harness)
+    identities: Identities = field(default_factory=Identities)
 
     def validate(self) -> None:
         if not self.repo or "/" not in self.repo:
@@ -217,6 +240,8 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> Config:
         cfg.planner = _build(Planner, raw["planner"])
     if isinstance(raw.get("harness"), dict):
         cfg.harness = _build(Harness, raw["harness"])
+    if isinstance(raw.get("identities"), dict):
+        cfg.identities = _build(Identities, raw["identities"])
 
     cfg.validate()
     return cfg

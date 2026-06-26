@@ -1215,3 +1215,55 @@ def test_reap_clears_in_progress_on_finished_pr(tmp_path):
 
     # The finished PR's issue (#1, from branch idle/issue-1) gets in-progress cleared.
     assert (1, "idle:in-progress") in gh.removed_labels
+
+
+# --------------------------------------------------------------------------- #
+# Per-agent GitHub identities (#29)
+# --------------------------------------------------------------------------- #
+class RecordingClient:
+    """A GitHub client stand-in tagged with a username, recording its comments."""
+
+    def __init__(self, user: str):
+        self.user = user
+        self.comments: list[tuple[int, str]] = []
+
+    def comment(self, number: int, body: str) -> None:
+        self.comments.append((number, body))
+
+    def upsert_comment(self, number: int, marker: str, body: str) -> None:
+        self.comments.append((number, body))
+
+
+def test_each_agent_comments_under_its_own_identity(tmp_path):
+    # With per-agent identities configured, comments from different agents land
+    # on different clients -> different usernames on the thread.
+    from agents.identity import IMPLEMENTER, LOOP, PLANNER, REVIEWER, IdentityRouter
+
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=True
+    )
+    clients = {
+        a: RecordingClient(a) for a in (PLANNER, REVIEWER, LOOP, IMPLEMENTER)
+    }
+    orch.identities = IdentityRouter(gh, clients)
+
+    rec = orch.process_ticket(ticket(1))
+    assert rec.outcome == Outcome.PARKED  # require_human keeps it open
+
+    # The planner priced it (cost chip); the reviewer posted the park verdict.
+    assert clients[PLANNER].comments, "planner posted the cost chip"
+    assert clients[REVIEWER].comments, "reviewer posted the review verdict"
+    # Distinct agents -> distinct usernames.
+    users_who_posted = {c.user for c in clients.values() if c.comments}
+    assert len(users_who_posted) >= 2
+    assert {PLANNER, REVIEWER} <= users_who_posted
+
+
+def test_default_identity_unchanged_when_not_configured(tmp_path):
+    # No per-agent clients -> every agent shares the default (current behaviour):
+    # the cost chip still lands on the one default client.
+    orch, gh, implementer, reviewer = make_orch(
+        tmp_path, issues=[ticket(1)], require_human=True
+    )
+    orch.process_ticket(ticket(1))
+    assert (1, idle_loop.COST_CHIP_MARKER) in gh.sticky  # posted via the default
