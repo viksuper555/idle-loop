@@ -500,11 +500,19 @@ class Orchestrator:
         dry_run: bool = False,
         max_parallel: int | None = None,
     ) -> list[RunRecord]:
-        """Process ready tickets until the backlog, cap, or limit is reached.
+        """Run one full pass: service pending PR reviews, then work ready tickets.
+
+        A single pass does both halves of the loop so no separate command is
+        needed: it first addresses actionable new reviews on open ``idle:listen``
+        PRs (revising each branch in place via :meth:`watch_reviews`), then picks
+        up ready tickets. Reviews go first so a human's requested changes land
+        before budget is spent opening new work. ``--watch-reviews`` remains an
+        explicit review-only entrypoint for back-compat.
 
         ``max_parallel`` (defaults to ``budget.max_parallel``) caps how many
         tickets are worked concurrently — each in its own git worktree so the
         implementers never clobber one another's checkout. ``1`` is sequential.
+        ``dry_run`` only lists ready tickets and takes no action (no reviews).
         """
         tickets = self.discover()
         self.log.info("discovered %d ready ticket(s)", len(tickets))
@@ -523,6 +531,12 @@ class Orchestrator:
         self._ensure_labels()
         # Reclaim worktrees whose PRs have since merged/closed before dispatching.
         self._reap_worktrees()
+
+        # Service review feedback on open idle:listen PRs first, in the same pass
+        # — so requested changes are addressed before new tickets spend budget.
+        # watch_reviews() self-handles a rate limit (emits the marker, re-raises),
+        # so it propagates straight out without a second _on_rate_limit below.
+        self.watch_reviews()
 
         parallel = self.config.budget.max_parallel if max_parallel is None else max_parallel
         parallel = max(1, parallel)
@@ -1424,8 +1438,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--watch-reviews",
         action="store_true",
-        help="check open idle:listen PRs for new reviews and address requested "
-        "changes by resuming each PR's saved context, then exit (no ticket pass)",
+        help="review-only entrypoint: check open idle:listen PRs for new reviews "
+        "and address requested changes, then exit (no ticket pass). The normal "
+        "pass already services reviews too, so this is no longer required",
     )
     return parser
 
@@ -1465,8 +1480,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     orch = Orchestrator.from_config(config, repo_dir=args.repo_dir)
     try:
         if args.watch_reviews:
+            # Explicit review-only entrypoint (back-compat). The normal pass below
+            # already services reviews too — this is no longer the only way.
             orch.watch_reviews()
         else:
+            # One pass does both: service idle:listen PR reviews, then work tickets.
             orch.run(
                 max_tickets=args.max_tickets,
                 dry_run=args.dry_run,

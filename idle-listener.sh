@@ -21,9 +21,10 @@
 #   ./idle-listener.sh -- --max-tickets 3
 #   ./idle-listener.sh --watch --interval 900 -- --repo-dir ../target-clone
 #
-# --watch keeps polling the board every INTERVAL seconds (default 600), working
-# new idle:ready tickets as they appear. A rate limit still parks to cron and
-# resumes the watch when the window resets.
+# --watch keeps polling the board every INTERVAL seconds (default 600). Each pass
+# runs `python idle_loop.py`, which now does both halves of the loop: it services
+# review feedback on open idle:listen PRs and works new idle:ready tickets. A rate
+# limit still parks to cron and resumes the watch when the window resets.
 #
 # macOS note: the cron daemon may need Full Disk Access (System Settings ->
 # Privacy & Security) to run, and `claude` must be resolvable on PATH (this
