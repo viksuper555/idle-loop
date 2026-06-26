@@ -629,14 +629,51 @@ class Orchestrator:
     def _branch_for(self, ticket: Ticket) -> str:
         """The branch to implement ``ticket`` on: ``<prefix>/issue-<id>``.
 
-        Reuses the canonical name when a worktree for it already exists (we are
-        resuming that effort); otherwise dedupes against existing local heads so
-        a name already taken by unrelated work gets a ``-b``/``-c`` suffix.
+        Resumes the ticket's *own* prior branch when one already exists — its
+        worktree, a persisted ``pr_watch`` record, or an open PR on it — so a
+        re-processed ticket continues in place instead of starting over on a
+        ``-b``/``-c`` name (sequential runs build the branch in the main checkout
+        with no worktree, so worktree-presence alone missed this). Only when the
+        canonical name is held by *unrelated* work (a bare colliding head with no
+        idle-loop ownership marker) does it fall through to ``dedupe_branch`` for
+        a free suffixed name — and branch selection then agrees with the worktree
+        path, since both derive from the same resolved name.
         """
         canonical = naming.canonical_branch(ticket)
-        if os.path.isdir(self._worktree_path(canonical)):
+        if self._is_resumable_branch(ticket, canonical):
+            self.log.info("#%s resuming existing branch %s", ticket.number, canonical)
             return canonical
         return naming.dedupe_branch(canonical, self._branch_exists)
+
+    def _is_resumable_branch(self, ticket: Ticket, branch: str) -> bool:
+        """Whether ``branch`` already carries this ticket's prior idle-loop work.
+
+        Recognised — and tied back to the issue id — by any of: an existing
+        worktree directory, a persisted ``pr_watch`` record, or an open PR on the
+        branch. A bare local head with none of these is treated as unrelated work
+        (so it dedupes), not a resume.
+        """
+        if naming.issue_number_from_branch(branch) != ticket.number:
+            return False
+        if os.path.isdir(self._worktree_path(branch)):
+            return True
+        if self._pr_watch_has_branch(branch):
+            return True
+        return self._open_pr_exists(branch)
+
+    def _pr_watch_has_branch(self, branch: str) -> bool:
+        """Whether any persisted PR-watch record was opened on ``branch``."""
+        return any(
+            rec.get("branch") == branch for rec in self._load_pr_watch().values()
+        )
+
+    def _open_pr_exists(self, branch: str) -> bool:
+        """Best-effort: whether an open PR exists for head ``branch``."""
+        try:
+            return self.github.find_open_pr_by_head(branch) is not None
+        except GitHubError as exc:
+            self.log.warning("open-PR lookup for %s failed: %s", branch, exc)
+            return False
 
     def _make_worktree(self, ticket: Ticket, branch: str) -> str:
         """Return an isolated git worktree for ``branch``, creating it if needed.
