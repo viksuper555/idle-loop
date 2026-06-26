@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy this to .idle-loop/agents-apps.json (gitignored) and fill in. One GitHub App per agent, all owned by viksuper555. Get app_id from the app's settings page; installation_id from the install URL (.../installations/<id>) or `gh api /repos/viksuper555/idle-loop/installation --jq .id`; private_key is the .pem you download when you generate the app's key. NEVER commit the filled-in file or the .pem keys.",
+  "planner":     { "app_id": "111111", "installation_id": "22222222", "private_key": ".idle-loop/keys/planner.pem" },
+  "implementer": { "app_id": "111112", "installation_id": "22222223", "private_key": ".idle-loop/keys/implementer.pem" },
+  "reviewer":    { "app_id": "111113", "installation_id": "22222224", "private_key": ".idle-loop/keys/reviewer.pem" },
+  "loop":        { "app_id": "111114", "installation_id": "22222225", "private_key": ".idle-loop/keys/loop.pem" }
+}

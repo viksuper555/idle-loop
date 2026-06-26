@@ -169,20 +169,30 @@ By default every comment idle-loop posts uses one token, so the planner, reviewe
 the loop itself all show up as the **same** GitHub user — confusing on a thread. Opt into distinct
 identities so each agent comments under its own username:
 
-1. **Provision the identities (human, one-time).** Create a GitHub App per agent (or a bot account
-   with its own PAT) and install it on the repo. This is a secrets/permissions step the code can't
-   do for you. Mint an installation token (or use the bot PAT) for each.
-2. **Expose them via env** and turn the feature on in `idle.config.yaml`:
+1. **Create one GitHub App per agent, owned by `viksuper555`** (browser — `gh` can't register apps).
+   For each of `planner`, `implementer`, `reviewer`, `loop`:
+   - **Settings → Developer settings → GitHub Apps → New GitHub App** (under the `viksuper555` account).
+   - Name it distinctly (`idle-planner`, `idle-implementer`, …) — that name becomes the `…[bot]` comment
+     author. Set any Homepage URL; under **Webhook**, uncheck **Active**.
+   - **Permissions → Repository:** Issues **R&W**, Pull requests **R&W**, Contents **R&W** (the
+     implementer commits/pushes), Metadata **R**.
+   - Create it, **Generate a private key** (downloads a `.pem`), and note the **App ID**.
+   - **Install App** on `viksuper555/idle-loop` (only-select-repositories).
+2. **Collect credentials** into `.idle-loop/agents-apps.json` (gitignored — copy
+   `examples/agents-apps.example.json`); drop each `.pem` under `.idle-loop/keys/`. Each
+   `installation_id` is in the install URL (`.../installations/<id>`) or via
+   `gh api "/repos/viksuper555/idle-loop/installation" --jq .id`.
+3. **Mint tokens and run** — installation tokens last ~1h, so re-mint per session:
 
-   ```yaml
-   identities:
-     enabled: true
-     tokens:                       # agent -> env var holding its token
-       planner: IDLE_GH_TOKEN_PLANNER
-       implementer: IDLE_GH_TOKEN_IMPLEMENTER
-       reviewer: IDLE_GH_TOKEN_REVIEWER
-       loop: IDLE_GH_TOKEN_LOOP
+   ```bash
+   ./mint-agent-tokens.sh            # -> .idle-loop/agents.env (gitignored, chmod 600)
+   ./mint-agent-tokens.sh --check    # validate config + report each bot login, no write
+   source .idle-loop/agents.env      # export IDLE_GH_TOKEN_* for this shell
+   python idle_loop.py --max-tickets N
    ```
+
+   `identities.enabled: true` and the `tokens:` env-var map are already set in `idle.config.yaml`.
+   **Tokens never live in the yaml or in git** — only the env-var *names* do.
 
 Any agent whose env var is unset falls back to the shared default token, so this is safe to enable
 incrementally. With it off (the default) behaviour is exactly as before. The cost chip posts as the

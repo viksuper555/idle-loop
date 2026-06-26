@@ -71,3 +71,17 @@ harness:                          # agents run via the Claude Code CLI (no API k
   timeout_s: 3600                 # hard wall-clock per claude invocation
   rate_limit_window_hours: 5.0    # fallback reset window if the notice can't be parsed
   extra_args: []                  # any extra flags to pass to `claude`
+
+identities:                       # per-agent GitHub identities (#29 / #41)
+  # Each logical agent comments under its OWN GitHub App, so a thread shows who
+  # did what. Tokens are NEVER stored here — these are the names of the ENV VARS
+  # holding each agent's installation token, minted by ./mint-agent-tokens.sh from
+  # the apps you create in viksuper555 (see README → "Per-agent GitHub identities").
+  # An agent whose env var is unset falls back to the shared default token, so this
+  # is safe to leave enabled before you've provisioned every app.
+  enabled: true
+  tokens:
+    planner: IDLE_GH_TOKEN_PLANNER
+    implementer: IDLE_GH_TOKEN_IMPLEMENTER
+    reviewer: IDLE_GH_TOKEN_REVIEWER
+    loop: IDLE_GH_TOKEN_LOOP
