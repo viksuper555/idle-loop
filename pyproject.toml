@@ -11,10 +11,11 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Idle" }]
 dependencies = [
-    "anthropic>=0.40",
     "PyYAML>=6.0",
     "requests>=2.31",
 ]
+# Agents run through the Claude Code CLI (the `claude` binary, installed
+# separately) — no Python Anthropic SDK / API key required.
 
 [project.optional-dependencies]
 dev = [

@@ -1,158 +1,90 @@
-"""Tests for the implementer agent — every external boundary mocked.
+"""Tests for the implementer agent — harness + git fully mocked.
 
-The Anthropic client is a scripted fake; ``subprocess.run`` (git + bash) is
-monkeypatched. No network, no real git, no real shell.
+The Claude Code harness is a fake (returns a HarnessResult or raises
+HarnessRateLimited); ``subprocess.run`` (git) is monkeypatched. No `claude`,
+no real git, no network.
 """
 
 from __future__ import annotations
 
 import subprocess
-from types import SimpleNamespace
 
 import pytest
 
+from agents.harness import HarnessError, HarnessRateLimited, HarnessResult
 from agents.implementer import Implementer
 from config import Config
+from models import Ticket
 
 
-# --------------------------------------------------------------------------- #
-# Fakes
-# --------------------------------------------------------------------------- #
-def tool_use_response(command="echo hi", in_tok=1000, out_tok=1000):
-    block = SimpleNamespace(type="tool_use", name="bash", id="t1", input={"command": command})
-    return SimpleNamespace(
-        stop_reason="tool_use",
-        content=[block],
-        usage=SimpleNamespace(input_tokens=in_tok, output_tokens=out_tok),
-    )
+class FakeHarness:
+    def __init__(self, result=None, raises=None):
+        self.result = result or HarnessResult(text="done", cost_usd=0.42, num_turns=3)
+        self.raises = raises
+        self.calls: list[dict] = []
+
+    def run(self, prompt, cwd, **kw):
+        self.calls.append({"prompt": prompt, "cwd": cwd, **kw})
+        if self.raises is not None:
+            raise self.raises
+        return self.result
 
 
-def end_turn_response(in_tok=500, out_tok=500):
-    block = SimpleNamespace(type="text", text="done")
-    return SimpleNamespace(
-        stop_reason="end_turn",
-        content=[block],
-        usage=SimpleNamespace(input_tokens=in_tok, output_tokens=out_tok),
-    )
+def fake_git(diff="+added\n", names="src/feature.py\n", checkout_rc=0):
+    def run(cmd, *args, **kwargs):
+        if "--name-only" in cmd:
+            out = names
+        elif "diff" in cmd:
+            out = diff
+        elif "checkout" in cmd:
+            return subprocess.CompletedProcess(cmd, checkout_rc, stdout="", stderr="")
+        else:
+            out = ""
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    return run
 
 
-class ScriptedClient:
-    def __init__(self, responses, loop=False):
-        self._responses = list(responses)
-        self._loop = loop
-        self._i = 0
-        self.calls = 0
-        self.messages = SimpleNamespace(create=self._create)
-
-    def _create(self, **kw):
-        self.calls += 1
-        if self._i >= len(self._responses):
-            if self._loop:
-                self._i = 0
-            else:
-                raise AssertionError("scripted client exhausted")
-        resp = self._responses[self._i]
-        self._i += 1
-        return resp
+def ticket(n=1):
+    return Ticket(number=n, title="t", body="b", acceptance_criteria=["x"])
 
 
-def make_fake_run(bash_returncode=0, bash_out="ok\n", diff="+added\n", names="src/feature.py\n"):
-    def fake_run(cmd, *args, **kwargs):
-        if cmd and cmd[0] == "git":
-            if "--name-only" in cmd:
-                out = names
-            elif "diff" in cmd:
-                out = diff
-            else:  # checkout etc.
-                out = ""
-            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
-        if cmd and cmd[0] == "bash":
-            return subprocess.CompletedProcess(cmd, bash_returncode, stdout=bash_out, stderr="")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+def test_run_reads_cost_and_diff_from_harness(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    harness = FakeHarness(HarnessResult(text="done", cost_usd=0.42, num_turns=4))
+    impl = Implementer(Config(repo="o/n"), harness=harness)
 
-    return fake_run
+    res = impl.run(ticket(1), str(tmp_path), "idle/issue-1")
 
-
-def cfg(**over) -> Config:
-    c = Config(repo="o/n")
-    if "no_progress_limit" in over:
-        c.budget.no_progress_limit = over["no_progress_limit"]
-    if "max_iterations" in over:
-        c.budget.max_iterations = over["max_iterations"]
-    return c
+    assert res.branch == "idle/issue-1"
+    assert res.cost_usd == pytest.approx(0.42)
+    assert res.iterations == 4
+    assert res.files_changed == ["src/feature.py"]
+    assert "+added" in res.diff
+    assert not res.error
+    # The harness was invoked once in the repo dir.
+    assert harness.calls and harness.calls[0]["cwd"] == str(tmp_path)
+    assert "idle/issue-1" not in harness.calls[0]["prompt"]  # branch is git-managed, not prompted
 
 
-# --------------------------------------------------------------------------- #
-# Tests
-# --------------------------------------------------------------------------- #
-def test_run_completes_and_accounts_cost(monkeypatch, tmp_path):
-    monkeypatch.setattr(subprocess, "run", make_fake_run())
-    client = ScriptedClient([tool_use_response(), end_turn_response()])
-    impl = Implementer(cfg(), client=client)
-    from models import Ticket
+def test_rate_limit_propagates(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    harness = FakeHarness(raises=HarnessRateLimited(reset_at=123.0, reset_human="usage limit"))
+    impl = Implementer(Config(repo="o/n"), harness=harness)
+    with pytest.raises(HarnessRateLimited):
+        impl.run(ticket(1), str(tmp_path), "idle/issue-1")
 
-    ticket = Ticket(number=1, title="t", body="b", acceptance_criteria=["x"])
-    result = impl.run(ticket, str(tmp_path), "idle/issue-1")
 
-    assert result.iterations == 2
-    assert result.branch == "idle/issue-1"
-    assert result.files_changed == ["src/feature.py"]
-    assert "+added" in result.diff
-    assert not result.no_progress and not result.error
-    # input 1500, output 1500 -> 1500/1e6*5 + 1500/1e6*25 = 0.0075 + 0.0375
-    assert result.cost_usd == pytest.approx(0.045, rel=1e-3)
-    assert result.input_tokens == 1500 and result.output_tokens == 1500
+def test_harness_error_becomes_failed_result(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    harness = FakeHarness(raises=HarnessError("claude not found"))
+    impl = Implementer(Config(repo="o/n"), harness=harness)
+    res = impl.run(ticket(1), str(tmp_path), "idle/issue-1")
+    assert res.error and res.branch == "idle/issue-1"
 
 
 def test_safe_path_rejects_traversal(tmp_path):
-    impl = Implementer(cfg(), client=object())
-    inside = impl._safe_path(str(tmp_path), "src/x.py")
-    assert str(inside).startswith(str(tmp_path.resolve()))
+    impl = Implementer(Config(repo="o/n"), harness=FakeHarness())
+    assert str(impl._safe_path(str(tmp_path), "src/x.py")).startswith(str(tmp_path.resolve()))
     with pytest.raises(ValueError):
         impl._safe_path(str(tmp_path), "../escape.py")
-
-
-def test_no_progress_detector_bails(monkeypatch, tmp_path):
-    # Bash always fails (same error) and the diff never changes -> no progress.
-    monkeypatch.setattr(
-        subprocess, "run", make_fake_run(bash_returncode=1, bash_out="boom\n", diff="+same\n")
-    )
-    client = ScriptedClient([tool_use_response(command="false")], loop=True)
-    impl = Implementer(cfg(no_progress_limit=3, max_iterations=20), client=client)
-    from models import Ticket
-
-    ticket = Ticket(number=2, title="t", body="b", acceptance_criteria=["x"])
-    result = impl.run(ticket, str(tmp_path), "idle/issue-2")
-
-    assert result.no_progress is True
-    assert result.iterations == 3  # bailed at the no-progress limit
-
-
-def test_run_never_raises_on_client_error(tmp_path):
-    class BoomClient:
-        def __init__(self):
-            self.messages = SimpleNamespace(create=self._boom)
-
-        def _boom(self, **kw):
-            raise RuntimeError("api down")
-
-    impl = Implementer(cfg(), client=BoomClient())
-    from models import Ticket
-
-    ticket = Ticket(number=3, title="t", body="b", acceptance_criteria=["x"])
-    result = impl.run(ticket, str(tmp_path), "idle/issue-3")
-    assert result.error  # captured, not raised
-    assert result.branch == "idle/issue-3"
-
-
-def test_editor_tool_confined_to_repo(monkeypatch, tmp_path):
-    monkeypatch.setattr(subprocess, "run", make_fake_run())
-    impl = Implementer(cfg(), client=object())
-    # create then view a file inside the repo
-    out, err = impl._run_editor(str(tmp_path), "create", {"path": "src/new.py", "file_text": "x=1\n"})
-    assert not err and "created" in out
-    out, err = impl._run_editor(str(tmp_path), "view", {"path": "src/new.py"})
-    assert not err and "x=1" in out
-    # traversal is rejected
-    out, err = impl._run_editor(str(tmp_path), "create", {"path": "../evil.py", "file_text": "bad"})
-    assert err and "escapes" in out

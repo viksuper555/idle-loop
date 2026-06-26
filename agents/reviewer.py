@@ -1,178 +1,116 @@
-"""The review agent — a deliberately separate role from the implementer.
+"""The reviewer agent — backed by the Claude Code harness.
 
-The reviewer is a fresh, skeptical context whose *only* job is to decide
-whether a diff actually satisfies a ticket's acceptance criteria — not whether
-the code merely looks plausible. It never shares state, prompt, or instance
-with the implementer; the orchestrator constructs it independently and feeds it
-the implementer's output as untrusted input. This separation is the point:
-the agent that wrote the code is the worst judge of whether it works.
+A DISTINCT role and context from the implementer: its only job is to decide
+whether the diff actually satisfies the ticket's acceptance criteria — not
+whether the code merely looks plausible. It runs ``claude -p`` headlessly in an
+isolated temp directory with mutating tools disallowed, so it reasons over the
+diff (passed in the prompt) and returns a structured JSON verdict without
+touching the repo. Like the guards, it fails closed: any unparseable reply
+yields ``request_changes``.
 
-Like the guards, the reviewer fails closed. Any refusal, empty response, or
-parse error yields a ``request_changes`` verdict rather than a false approval.
+No API key — auth is the Claude Code login. A usage/session limit propagates as
+:class:`HarnessRateLimited`.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any
+import re
+import tempfile
 
-import anthropic
-
+from agents.harness import ClaudeHarness
 from config import Config
-from models import Decision, ReviewVerdict, Ticket
+from models import Decision, ReviewVerdict
 
-# Cap the diff we ship to the model so a runaway change can't blow the context
-# window. The reviewer is told explicitly when truncation has happened so it
-# treats a clipped diff as unverified (and therefore not approvable).
-_MAX_DIFF_CHARS = 60_000
+_READ_ONLY_DISALLOWED = ["Edit", "Write", "NotebookEdit", "Bash"]
 
-# JSON schema the model must conform to. Mirrors ReviewVerdict / ReviewComment.
-_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["decision", "summary", "comments"],
-    "properties": {
-        "decision": {
-            "type": "string",
-            "enum": ["approve", "request_changes"],
-        },
-        "summary": {"type": "string"},
-        "comments": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["path", "line", "body"],
-                "properties": {
-                    "path": {"type": "string"},
-                    "line": {"type": "integer"},
-                    "body": {"type": "string"},
-                },
-            },
-        },
-    },
-}
+_PROMPT = """You are a strict, independent code reviewer. Your ONLY job is to decide whether \
+the diff below actually satisfies the ticket's acceptance criteria — not whether the code \
+merely looks plausible. Request changes if ANY acceptance criterion is unmet, untested, or \
+only partially implemented. Approve ONLY when every criterion is demonstrably met and tested.
 
-_SYSTEM = """You are a skeptical, independent code reviewer. You did NOT write \
-this code, and your sole job is to decide whether the submitted diff ACTUALLY \
-satisfies the ticket's acceptance criteria — not whether the code merely looks \
-plausible or well-written.
+--- TICKET #{number}: {title} ---
+{body}
 
-Be adversarial about evidence. For every acceptance criterion, ask: is it \
-demonstrably implemented AND covered by a test or other proof in this diff?
+Acceptance criteria:
+{criteria}
 
-- Report `request_changes` if ANY acceptance criterion is unmet, untested, \
-only partially implemented, or addressed only by code that looks right but is \
-not exercised.
-- Approve ONLY when every acceptance criterion is demonstrably met.
-- If the diff was truncated, treat the unseen portion as unverified and do not \
-approve on faith.
+--- DIFF ---
+{diff}
 
-Put one concrete comment per problem, anchored to a file path and line where \
-you can, explaining what is missing and what would satisfy the criterion."""
+Respond with ONLY a single JSON object (no prose, no markdown fences) of the form:
+{{"decision": "approve" | "request_changes", "summary": "<one or two sentences>", \
+"comments": [{{"path": "<file>", "line": <int or null>, "body": "<what to fix>"}}]}}"""
 
-
-def _safe_default() -> ReviewVerdict:
-    """The fail-closed verdict used whenever we cannot trust the model output."""
-    return ReviewVerdict(
-        decision=Decision.REQUEST_CHANGES,
-        summary="reviewer could not produce a verdict; failing closed",
-        comments=[],
-    )
-
-
-def _truncate_diff(diff: str) -> str:
-    """Clip an oversized diff, flagging the clip so the model stays honest."""
-    if len(diff) <= _MAX_DIFF_CHARS:
-        return diff
-    head = diff[:_MAX_DIFF_CHARS]
-    omitted = len(diff) - _MAX_DIFF_CHARS
-    return (
-        f"{head}\n\n"
-        f"... [diff truncated: {omitted} characters omitted; the remainder "
-        f"was NOT shown to you — treat unseen changes as unverified] ..."
-    )
-
-
-def _format_criteria(criteria: list[str]) -> str:
-    if not criteria:
-        return "(no explicit acceptance criteria were parsed from the ticket)"
-    return "\n".join(f"- {c}" for c in criteria)
+_MAX_DIFF_CHARS = 60000
 
 
 class Reviewer:
-    """A separate review-agent context. Constructed independently of the implementer.
+    """Judges a diff against a ticket's acceptance criteria via the harness."""
 
-    The Anthropic client is created lazily so importing this module never
-    requires an API key; tests pass a fake ``client``.
-    """
-
-    def __init__(self, config: Config, client: Any | None = None) -> None:
+    def __init__(self, config: Config, harness: ClaudeHarness | None = None) -> None:
         self.config = config
-        self._client = client
+        self.harness = harness or ClaudeHarness(config)
 
-    @property
-    def client(self) -> Any:
-        if self._client is None:
-            self._client = anthropic.Anthropic()
-        return self._client
-
-    def _build_user_content(self, ticket: Ticket, diff: str) -> str:
-        return (
-            f"# Ticket #{ticket.number}: {ticket.title}\n\n"
-            f"## Description\n{ticket.body or '(no description)'}\n\n"
-            f"## Acceptance criteria\n{_format_criteria(ticket.acceptance_criteria)}\n\n"
-            f"## Unified diff under review\n```diff\n{_truncate_diff(diff)}\n```\n\n"
-            "Decide whether this diff demonstrably satisfies every acceptance "
-            "criterion above, and return your verdict in the required schema."
+    def _build_prompt(self, ticket, diff: str) -> str:
+        criteria = ticket.acceptance_criteria or []
+        ac = "\n".join(f"- {c}" for c in criteria) if criteria else "(none listed)"
+        if len(diff) > _MAX_DIFF_CHARS:
+            diff = diff[:_MAX_DIFF_CHARS] + "\n... [diff truncated] ..."
+        return _PROMPT.format(
+            number=ticket.number, title=ticket.title, body=ticket.body, criteria=ac, diff=diff
         )
 
-    def review(self, ticket: Ticket, diff: str) -> ReviewVerdict:
-        """Review ``diff`` against ``ticket``'s acceptance criteria.
+    def review(self, ticket, diff: str) -> ReviewVerdict:
+        """Return the reviewer's verdict; fail closed on any parse problem.
 
-        Returns a :class:`ReviewVerdict`. Fails closed (``request_changes``) on
-        any refusal, empty response, or malformed output.
+        Lets :class:`HarnessRateLimited` propagate (do not swallow it).
         """
-        try:
-            response = self.client.messages.create(
-                model=self.config.model,
-                max_tokens=8000,
-                thinking={"type": "adaptive"},
-                output_config={
-                    "effort": "high",
-                    "format": {"type": "json_schema", "schema": _SCHEMA},
-                },
-                system=_SYSTEM,
-                messages=[
-                    {"role": "user", "content": self._build_user_content(ticket, diff)}
-                ],
+        with tempfile.TemporaryDirectory(prefix="idle-review-") as workdir:
+            result = self.harness.run(
+                self._build_prompt(ticket, diff),
+                cwd=workdir,
+                disallowed_tools=_READ_ONLY_DISALLOWED,
             )
-        except Exception:  # noqa: BLE001 - fail closed on any SDK/transport error
-            return _safe_default()
+        data = _extract_json(result.text)
+        if data is None:
+            return ReviewVerdict(
+                decision=Decision.REQUEST_CHANGES,
+                summary="reviewer did not return a parseable verdict; failing closed",
+                comments=[],
+            )
+        return ReviewVerdict.from_dict(data)
 
-        text = _first_text_block(response)
-        if not text:
-            return _safe_default()
 
+_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _extract_json(text: str) -> dict | None:
+    """Pull a JSON object out of the model's reply (tolerating fences/prose)."""
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        pass
+    fence = _FENCE.search(text)
+    if fence:
         try:
-            data = json.loads(text)
-        except (ValueError, TypeError):
-            return _safe_default()
-        if not isinstance(data, dict):
-            return _safe_default()
-
+            data = json.loads(fence.group(1))
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            return None
+    obj = _OBJECT.search(text)
+    if obj:
         try:
-            return ReviewVerdict.from_dict(data)
-        except Exception:  # noqa: BLE001 - any shape we didn't expect -> fail closed
-            return _safe_default()
+            data = json.loads(obj.group(0))
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
-def _first_text_block(response: Any) -> str:
-    """Pull the first text block out of an Anthropic-style response."""
-    content = getattr(response, "content", None)
-    if not content:
-        return ""
-    for block in content:
-        if getattr(block, "type", None) == "text":
-            return getattr(block, "text", "") or ""
-    return ""
+__all__ = ["Reviewer"]

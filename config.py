@@ -75,6 +75,27 @@ class Estimator:
 
 
 @dataclass
+class Harness:
+    """How the agents reach Claude.
+
+    The default backend is the **Claude Code harness** (the ``claude`` CLI in
+    headless ``-p`` mode), which authenticates via your Claude login — no API
+    key. The implementer hands the whole ticket to Claude Code and lets it edit
+    files / run tests with its own tools; the reviewer runs read-only.
+    """
+
+    backend: str = "claude_code"  # "claude_code" (only backend; here for forward-compat)
+    claude_bin: str = "claude"  # binary name or absolute path
+    skip_permissions: bool = True  # --dangerously-skip-permissions (unattended)
+    output_format: str = "json"
+    extra_args: list[str] = field(default_factory=list)
+    timeout_s: int = 3600  # hard wall-clock per claude invocation
+    # When the harness reports a usage/session limit with no parseable reset
+    # time, assume the window resets this many hours out.
+    rate_limit_window_hours: float = 5.0
+
+
+@dataclass
 class Config:
     repo: str = ""
     model: str = "claude-opus-4-8"
@@ -86,6 +107,7 @@ class Config:
     merge: Merge = field(default_factory=Merge)
     pricing: Pricing = field(default_factory=Pricing)
     estimator: Estimator = field(default_factory=Estimator)
+    harness: Harness = field(default_factory=Harness)
 
     def validate(self) -> None:
         if not self.repo or "/" not in self.repo:
@@ -137,6 +159,8 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> Config:
         cfg.pricing = _build(Pricing, raw["pricing"])
     if isinstance(raw.get("estimator"), dict):
         cfg.estimator = _build(Estimator, raw["estimator"])
+    if isinstance(raw.get("harness"), dict):
+        cfg.harness = _build(Harness, raw["harness"])
 
     cfg.validate()
     return cfg
