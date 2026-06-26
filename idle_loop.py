@@ -29,6 +29,7 @@ from datetime import datetime
 import naming
 import pr_template
 from agents.harness import HarnessRateLimited
+from agents.identity import IMPLEMENTER, LOOP, PLANNER, REVIEWER, IdentityRouter
 from config import Config, load_config
 from costlog import append_record
 from github_client import GitHubClient, GitHubError
@@ -85,9 +86,13 @@ class Orchestrator:
         repo_dir: str = ".",
         logger: logging.Logger | None = None,
         planner=None,
+        identities: IdentityRouter | None = None,
     ) -> None:
         self.config = config
         self.github = github
+        # Routes each logical agent's comments to its own GitHub identity; with
+        # none configured every agent shares ``github`` (current behaviour).
+        self.identities = identities or IdentityRouter(github)
         self.estimator = estimator
         self.planner = planner
         self.implementer = implementer
@@ -115,9 +120,12 @@ class Orchestrator:
         from agents.reviewer import Reviewer
 
         estimator = Estimator(config)
+        github = GitHubClient(config.repo)
+        identities = IdentityRouter.from_config(config, github, GitHubClient)
         return cls(
             config=config,
-            github=GitHubClient(config.repo),
+            github=github,
+            identities=identities,
             estimator=estimator,
             planner=Planner(config),
             implementer=Implementer(config),
@@ -318,6 +326,7 @@ class Orchestrator:
                 f"**idle-loop estimate: {band}** — above the ${threshold:g} "
                 "auto-run threshold, so parking for a human to triage.\n\n"
                 + _estimate_detail(estimate),
+                agent=PLANNER,
             )
             self._flag_needs_human(ticket)
             return self._record(ticket, estimate, None, Outcome.SKIPPED)
@@ -507,9 +516,14 @@ class Orchestrator:
             return self._record(ticket, estimate, impl, Outcome.MERGED)
 
         # Park: either review requested changes, or human approval is required.
+        # The verdict is the reviewer's, so it posts under the reviewer identity.
         self.log.info("#%s parked for human", ticket.number)
         self._flag_needs_human(ticket)
-        self._comment(ticket, _park_message(verdict, pr, self.config.merge.require_human))
+        self._comment(
+            ticket,
+            _park_message(verdict, pr, self.config.merge.require_human),
+            agent=REVIEWER,
+        )
         return self._record(ticket, estimate, impl, Outcome.PARKED)
 
     # ------------------------------------------------------------------ #
@@ -829,9 +843,9 @@ class Orchestrator:
         except GitHubError as exc:
             self.log.warning("ensure_labels failed (continuing): %s", exc)
 
-    def _comment(self, ticket: Ticket, body: str) -> None:
+    def _comment(self, ticket: Ticket, body: str, agent: str = LOOP) -> None:
         try:
-            self.github.comment(ticket.number, body)
+            self.identities.client(agent).comment(ticket.number, body)
         except GitHubError as exc:
             self.log.warning("comment on #%s failed: %s", ticket.number, exc)
 
@@ -845,10 +859,10 @@ class Orchestrator:
         except GitHubError as exc:
             self.log.warning("add_label %s on #%s failed: %s", label, number, exc)
 
-    def _comment_num(self, number: int, body: str) -> None:
+    def _comment_num(self, number: int, body: str, agent: str = LOOP) -> None:
         """Comment on issue/PR ``number`` (PR comments share the issues API)."""
         try:
-            self.github.comment(number, body)
+            self.identities.client(agent).comment(number, body)
         except GitHubError as exc:
             self.log.warning("comment on #%s failed: %s", number, exc)
 
@@ -898,7 +912,8 @@ class Orchestrator:
         a convenience for humans watching the board, not part of the contract.
         """
         try:
-            self.github.upsert_comment(
+            # The cost chip is the planner's voice (it priced the ticket).
+            self.identities.client(PLANNER).upsert_comment(
                 ticket.number,
                 COST_CHIP_MARKER,
                 _cost_chip_body(estimate, spent, spent_tokens),
@@ -1273,10 +1288,12 @@ class Orchestrator:
             )
             return True
 
+        # The implementer did the revision, so it speaks here.
         self._comment(
             ticket,
             f"🤖 **idle-loop addressed the latest review on this PR** "
             f"(revision {rec['attempts']}/{self.config.budget.review_iterations}).\n\n{SHIPPED_BY}",
+            agent=IMPLEMENTER,
         )
         return True
 

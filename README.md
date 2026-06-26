@@ -163,6 +163,32 @@ python idle_loopd.py --once          # a single pass, then exit
 front door — it walks dry-run estimates, label sync, and a bounded pass. The unattended daemon,
 though, is the listener + cron above (a skill only runs inside a session).
 
+### Per-agent GitHub identities
+
+By default every comment idle-loop posts uses one token, so the planner, reviewer, implementer, and
+the loop itself all show up as the **same** GitHub user — confusing on a thread. Opt into distinct
+identities so each agent comments under its own username:
+
+1. **Provision the identities (human, one-time).** Create a GitHub App per agent (or a bot account
+   with its own PAT) and install it on the repo. This is a secrets/permissions step the code can't
+   do for you. Mint an installation token (or use the bot PAT) for each.
+2. **Expose them via env** and turn the feature on in `idle.config.yaml`:
+
+   ```yaml
+   identities:
+     enabled: true
+     tokens:                       # agent -> env var holding its token
+       planner: IDLE_GH_TOKEN_PLANNER
+       implementer: IDLE_GH_TOKEN_IMPLEMENTER
+       reviewer: IDLE_GH_TOKEN_REVIEWER
+       loop: IDLE_GH_TOKEN_LOOP
+   ```
+
+Any agent whose env var is unset falls back to the shared default token, so this is safe to enable
+incrementally. With it off (the default) behaviour is exactly as before. The cost chip posts as the
+**planner**, the review verdict as the **reviewer**, in-PR revision notes as the **implementer**,
+and parks/merges/guard verdicts as the **loop**.
+
 ### CLI
 
 | Flag | Default | Meaning |
