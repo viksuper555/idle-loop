@@ -222,6 +222,58 @@ class GitHubClient:
         data = resp.json()
         return {"number": data["number"], "html_url": data["html_url"]}
 
+    def list_pull_requests_by_label(self, label: str) -> list[dict]:
+        """List open PRs carrying ``label`` as ``{"number", "title"}`` dicts.
+
+        The issues endpoint is the only one that filters by label, and it returns
+        both issues and PRs; entries *with* a ``pull_request`` key are the PRs.
+        """
+        resp = self._request(
+            "GET",
+            f"/repos/{self.repo}/issues",
+            params={"state": "open", "labels": label, "per_page": 100},
+        )
+        return [
+            {"number": int(item["number"]), "title": item.get("title", "")}
+            for item in resp.json()
+            if "pull_request" in item
+        ]
+
+    def get_pull_request(self, number: int) -> dict:
+        """Fetch a PR as ``{"number", "head_branch", "state", "html_url"}``."""
+        data = self._request("GET", f"/repos/{self.repo}/pulls/{number}").json()
+        return {
+            "number": int(data["number"]),
+            "head_branch": data.get("head", {}).get("ref", ""),
+            "state": data.get("state", ""),
+            "html_url": data.get("html_url", ""),
+        }
+
+    def list_reviews(self, number: int) -> list[dict]:
+        """List submitted reviews on PR ``number``, oldest first.
+
+        Each review is ``{"id", "state", "body", "user", "submitted_at"}`` where
+        ``state`` is GitHub's review state (``APPROVED``, ``CHANGES_REQUESTED``,
+        ``COMMENTED``, ``DISMISSED``, ...) and ``user`` is the reviewer's login.
+        """
+        resp = self._request(
+            "GET",
+            f"/repos/{self.repo}/pulls/{number}/reviews",
+            params={"per_page": 100},
+        )
+        reviews = []
+        for r in resp.json():
+            reviews.append(
+                {
+                    "id": int(r["id"]),
+                    "state": r.get("state", ""),
+                    "body": r.get("body") or "",
+                    "user": (r.get("user") or {}).get("login", ""),
+                    "submitted_at": r.get("submitted_at", ""),
+                }
+            )
+        return reviews
+
     def pr_status_for_branch(self, branch: str) -> str:
         """Classify the PR lifecycle for head ``branch``.
 
