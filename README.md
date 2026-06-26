@@ -137,6 +137,28 @@ Set `IDLE_PYTHON` if `python3` isn't your interpreter. On macOS the cron daemon 
 Disk Access (System Settings → Privacy & Security), and `claude` must be on `PATH` (the listener
 bakes the resolved `PATH` into the cron entry).
 
+#### `idle_loopd.py` — the resident daemon (alternative to the bash listener)
+
+`idle_loopd.py` is a clean, stdlib-only resident **Python** process that does the same job as
+`idle-listener.sh --watch` without the cron one-shot dance and without a Claude session having to
+stay alive. It calls `Orchestrator.run()` every interval (each pass services `idle:listen` reviews
+*and* works tickets), and never exits after a pass.
+
+```bash
+python idle_loopd.py                 # resident loop, 600s interval (Ctrl-C to stop)
+python idle_loopd.py --interval 300  # poll every 5 min
+python idle_loopd.py --once          # a single pass, then exit
+```
+
+- **Single-instance.** A PID lock at `.idle-loop/idle-loopd.pid` makes a second daemon refuse to
+  start; a lock left by a dead PID is reclaimed automatically.
+- **Graceful stop.** SIGINT/SIGTERM finishes the current wait and exits 0, releasing the lock.
+- **Rate-limit recovery is internal.** A `HarnessRateLimited` from a pass is caught and the daemon
+  sleeps until the parsed reset epoch (the same `.idle-loop/rate_limit.json` the listener reads),
+  then resumes — no cron, no exit 42.
+
+`idle-listener.sh` is left in place for back-compat; pick whichever supervisor you prefer.
+
 **From a Claude Code session**, the `/idle-loop` skill (`.claude/skills/idle-loop/`) is the manual
 front door — it walks dry-run estimates, label sync, and a bounded pass. The unattended daemon,
 though, is the listener + cron above (a skill only runs inside a session).
