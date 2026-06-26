@@ -1,0 +1,38 @@
+# idle-loop configuration — see §9 of idle-loop_SPEC.md
+repo: "viksuper555/idle-loop"
+model: "claude-opus-4-8"          # the coding agent model
+cost_log_path: "cost_log.jsonl"
+
+labels:
+  ready: "idle:ready"
+  needs_human: "idle:needs-human"
+  allow_sensitive: "idle:allow-sensitive"
+
+triage:
+  auto_threshold_usd: 50          # above this, park for a human pre-run
+
+budget:
+  max_iterations: 20              # per ticket
+  per_ticket_cap_usd: 40
+  global_cap_usd: 200             # stop the whole loop here
+  no_progress_limit: 3            # same error / empty diff N times -> bail
+
+guards:
+  max_diff_lines: 400
+  max_files: 15
+  path_allowlist: ["src/**", "tests/**"]
+  path_denylist: ["**/secrets/**", ".github/**", "infra/**", "**/migrations/**"]
+  require_tests_for_new_behavior: true
+
+merge:
+  require_human: true             # default ON for protected branches
+  target_branch: "main"
+
+pricing:                          # USD per 1M tokens (claude-opus-4-8)
+  input_per_mtok: 5.0
+  output_per_mtok: 25.0
+  default_cost_per_iteration_usd: 2.0
+
+estimator:
+  use_learned: false              # v2 regression; flip on once enough rows exist
+  min_rows_for_learned: 20
