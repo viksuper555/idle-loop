@@ -106,6 +106,30 @@ def test_seeds_session_file_for_implementer_resume(tmp_path):
     assert (tmp_path / ".idle-loop" / "session").read_text(encoding="utf-8") == "sess-plan"
 
 
+def test_seeds_first_progress_from_plan(tmp_path):
+    # The planner authors the first PROGRESS.md so the implementer's portable
+    # memory exists from turn one, carrying the plan as the current approach.
+    from agents.implementer import load_progress
+
+    p, _ = planner(_budget_json())
+    res = p.plan(ticket(), str(tmp_path))
+    assert res is not None
+    body = load_progress(str(tmp_path))
+    assert body is not None
+    assert "## Current approach" in body
+    assert "do the thing" in body  # the plan text from _budget_json
+    # Prose only — never a raw token-budget dump.
+    assert "estimated_input_tokens" not in body
+
+
+def test_no_progress_seeded_when_unparseable(tmp_path):
+    from agents.implementer import load_progress
+
+    p, _ = planner("no json here")
+    assert p.plan(ticket(), str(tmp_path)) is None
+    assert load_progress(str(tmp_path)) is None  # nothing to seed without a plan
+
+
 def test_seeds_session_even_when_unparseable(tmp_path):
     from agents.implementer import load_session
 

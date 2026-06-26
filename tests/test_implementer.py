@@ -47,6 +47,17 @@ def fake_git(diff="+added\n", names="src/feature.py\n", checkout_rc=0, push_rc=0
     return run
 
 
+def recording_git(calls, **kw):
+    """A fake git that records every argv into ``calls`` for assertions."""
+    inner = fake_git(**kw)
+
+    def run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return inner(cmd, *args, **kwargs)
+
+    return run
+
+
 def ticket(n=1):
     return Ticket(number=n, title="t", body="b", acceptance_criteria=["x"])
 
@@ -153,6 +164,85 @@ def test_session_is_persisted_then_resumed(monkeypatch, tmp_path):
     # Second run (e.g. a revision): the saved session is resumed for context.
     impl.run(ticket(1), str(tmp_path), "idle/issue-1", feedback="fix X")
     assert harness.calls[1].get("resume_session_id") == "sess-abc"
+
+
+def test_run_with_no_session_succeeds_from_prompt_and_progress(monkeypatch, tmp_path):
+    # Cold start: no saved session. The run must still succeed end-to-end purely
+    # from prompt + PROGRESS.md + diff — --resume is demoted to an optimization.
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    (tmp_path / "PROGRESS.md").write_text(
+        "# Progress — #1: t\n\n## Done\nseeded by planner\n", encoding="utf-8"
+    )
+    harness = FakeHarness(HarnessResult(text="done", cost_usd=0.3, num_turns=2))
+    impl = Implementer(Config(repo="o/n"), harness=harness)
+
+    res = impl.run(ticket(1), str(tmp_path), "idle/issue-1")
+
+    assert harness.calls[0].get("resume_session_id") is None  # no resume required
+    assert not res.error and "+added" in res.diff
+    # The committed working memory rode along in the prompt.
+    assert "CURRENT PROGRESS.md" in harness.calls[0]["prompt"]
+    assert "seeded by planner" in harness.calls[0]["prompt"]
+
+
+def test_progress_written_and_committed_after_turn(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", recording_git(calls))
+    harness = FakeHarness(HarnessResult(text="implemented X", cost_usd=0.2, num_turns=2))
+    impl = Implementer(Config(repo="o/n"), harness=harness)
+
+    impl.run(ticket(7), str(tmp_path), "idle/issue-7")
+
+    # PROGRESS.md exists at the branch root, with the required prose sections.
+    body = (tmp_path / "PROGRESS.md").read_text(encoding="utf-8")
+    for section in ("## Done", "## Remaining", "## Current approach", "## Files touched"):
+        assert section in body
+    # And it was staged + committed on the branch.
+    assert ["git", "-C", str(tmp_path), "add", "PROGRESS.md"] in calls
+    commits = [c for c in calls if "commit" in c]
+    assert commits and any("PROGRESS.md" in c for c in commits)
+
+
+def test_progress_records_reviewer_asks_on_revision(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    harness = FakeHarness()
+    Implementer(Config(repo="o/n"), harness=harness).run(
+        ticket(1), str(tmp_path), "idle/issue-1", feedback="cover the Y case"
+    )
+    body = (tmp_path / "PROGRESS.md").read_text(encoding="utf-8")
+    assert "## Last reviewer asks" in body and "cover the Y case" in body
+
+
+def test_progress_prompt_includes_committed_contents(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    (tmp_path / "PROGRESS.md").write_text(
+        "# Progress\n\n## Current approach\nuse a registry\n", encoding="utf-8"
+    )
+    harness = FakeHarness()
+    Implementer(Config(repo="o/n"), harness=harness).run(
+        ticket(1), str(tmp_path), "idle/issue-1"
+    )
+    assert "use a registry" in harness.calls[0]["prompt"]
+
+
+def test_progress_rule_states_prose_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", fake_git())
+    harness = FakeHarness()
+    Implementer(Config(repo="o/n"), harness=harness).run(
+        ticket(1), str(tmp_path), "idle/issue-1"
+    )
+    prompt = harness.calls[0]["prompt"].lower()
+    assert "prose only" in prompt and "secret" in prompt
+
+
+def test_progress_helpers_roundtrip(tmp_path):
+    from agents.implementer import load_progress, write_progress
+
+    assert load_progress(str(tmp_path)) is None
+    write_progress(str(tmp_path), "# Progress\n\nstuff")
+    assert "stuff" in load_progress(str(tmp_path))
+    write_progress(str(tmp_path), "")  # empty is a no-op, keeps prior
+    assert "stuff" in load_progress(str(tmp_path))
 
 
 def test_safe_path_rejects_traversal(tmp_path):
