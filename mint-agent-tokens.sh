@@ -41,13 +41,14 @@ done
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 
 # Build a short-lived RS256 App JWT and exchange it for an installation token.
-mint_token() {  # $1=app_id $2=installation_id $3=private_key_path -> prints token
-  local app_id="$1" inst="$2" key="$3" now header payload unsigned sig jwt
+mint_token() {  # $1=iss (App client id, recommended; or app id) $2=installation_id $3=key -> token
+  local iss="$1" inst="$2" key="$3" now header payload unsigned sig jwt
   [ -f "$key" ] || { echo "  private key not found: $key" >&2; return 1; }
   now=$(date +%s)
   header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
-  # exp must be <= 10 min out; iat back-dated 60s for clock skew.
-  payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$app_id" | b64url)
+  # Per GitHub: RS256; iss = App client id (recommended) or app id; iat back-dated
+  # 60s for clock skew; exp must be <= 10 min out (we use 9).
+  payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$iss" | b64url)
   unsigned="${header}.${payload}"
   sig=$(printf '%s' "$unsigned" | openssl dgst -sha256 -sign "$key" -binary | b64url)
   jwt="${unsigned}.${sig}"
@@ -76,13 +77,14 @@ tmp="$OUT.tmp.$$"
 trap 'rm -f "$tmp"' EXIT
 rc=0
 for agent in $agents; do
-  read -r app_id inst key < <(python3 -c '
+  read -r iss inst key < <(python3 -c '
 import json, sys
 a = json.load(open(sys.argv[1]))[sys.argv[2]]
-print(a["app_id"], a["installation_id"], a["private_key"])
+# iss: GitHub recommends the App client id; the app id is also accepted.
+print(a.get("client_id") or a["app_id"], a["installation_id"], a["private_key"])
 ' "$APPS" "$agent")
-  printf 'minting %s (app %s, installation %s)... ' "$agent" "$app_id" "$inst"
-  if ! token=$(mint_token "$app_id" "$inst" "$key"); then
+  printf "minting %s (iss %s, installation %s)... " "$agent" "$iss" "$inst"
+  if ! token=$(mint_token "$iss" "$inst" "$key"); then
     echo "FAILED"; rc=1; continue
   fi
   env_var="IDLE_GH_TOKEN_$(printf '%s' "$agent" | tr '[:lower:]' '[:upper:]')"
