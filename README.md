@@ -176,10 +176,11 @@ identities so each agent comments under its own username:
      author. Set any Homepage URL; under **Webhook**, uncheck **Active**.
    - **Permissions → Repository:** Issues **R&W**, Pull requests **R&W**, Contents **R&W** (the
      implementer commits/pushes), Metadata **R**.
-   - Create it, **Generate a private key** (downloads a `.pem`), and note the **App ID**.
+   - Create it, **Generate a private key** (downloads a `.pem`), and note the **Client ID** (and App ID).
    - **Install App** on `viksuper555/idle-loop` (only-select-repositories).
 2. **Collect credentials** into `.idle-loop/agents-apps.json` (gitignored — copy
-   `examples/agents-apps.example.json`); drop each `.pem` under `.idle-loop/keys/`. Each
+   `examples/agents-apps.example.json`); drop each `.pem` under `.idle-loop/keys/`. Use the
+   **Client ID** as the JWT issuer (GitHub's recommendation; `app_id` is an accepted fallback). Each
    `installation_id` is in the install URL (`.../installations/<id>`) or via
    `gh api "/repos/viksuper555/idle-loop/installation" --jq .id`.
 3. **Mint tokens and run** — installation tokens last ~1h, so re-mint per session:
