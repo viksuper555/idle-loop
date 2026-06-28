@@ -140,6 +140,15 @@ class Harness:
 
 
 @dataclass
+class Review:
+    """How the loop responds to PR review feedback (summaries + inline threads)."""
+
+    # Post a reply on each addressed inline review-comment thread describing the
+    # change (CodeRabbit-style). Off -> revise silently without threading replies.
+    reply_to_inline: bool = True
+
+
+@dataclass
 class Identities:
     """Per-agent GitHub identities, so each agent comments under its own name.
 
@@ -184,6 +193,7 @@ class Config:
     planner: Planner = field(default_factory=Planner)
     harness: Harness = field(default_factory=Harness)
     identities: Identities = field(default_factory=Identities)
+    review: Review = field(default_factory=Review)
 
     def validate(self) -> None:
         if not self.repo or "/" not in self.repo:
@@ -242,6 +252,8 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> Config:
         cfg.harness = _build(Harness, raw["harness"])
     if isinstance(raw.get("identities"), dict):
         cfg.identities = _build(Identities, raw["identities"])
+    if isinstance(raw.get("review"), dict):
+        cfg.review = _build(Review, raw["review"])
 
     cfg.validate()
     return cfg

@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -1099,6 +1100,8 @@ class Orchestrator:
 
         reviews = self._safe_list_reviews(number)
         last_review_id = max((r["id"] for r in reviews), default=0)
+        inline = self._safe_list_review_comments(number)
+        last_comment_id = max((c["id"] for c in inline), default=0)
 
         with self._pr_watch_lock:
             state = self._load_pr_watch()
@@ -1108,6 +1111,7 @@ class Orchestrator:
                 "worktree": repo_dir,
                 "session_id": load_session(repo_dir) or "",
                 "last_review_id": last_review_id,
+                "last_comment_id": last_comment_id,
                 "attempts": 0,
             }
             self._save_pr_watch(state)
@@ -1117,6 +1121,13 @@ class Orchestrator:
             return self.github.list_reviews(number)
         except GitHubError as exc:
             self.log.warning("list_reviews for PR #%s failed: %s", number, exc)
+            return []
+
+    def _safe_list_review_comments(self, number: int) -> list[dict]:
+        try:
+            return self.github.list_review_comments(number)
+        except GitHubError as exc:
+            self.log.warning("list_review_comments for PR #%s failed: %s", number, exc)
             return []
 
     @staticmethod
@@ -1161,23 +1172,42 @@ class Orchestrator:
                     continue
 
                 reviews = self._safe_list_reviews(number)
-                last_seen = int(rec.get("last_review_id", 0))
-                new_reviews = [r for r in reviews if r["id"] > last_seen]
-                if not new_reviews:
+                inline = self._safe_list_review_comments(number)
+                last_review = int(rec.get("last_review_id", 0))
+                last_comment = int(rec.get("last_comment_id", 0))
+                new_reviews = [r for r in reviews if r["id"] > last_review]
+                new_inline_any = [c for c in inline if c["id"] > last_comment]
+                # Top-level inline comments only drive a revision — a reply
+                # (in_reply_to_id set) is part of an existing thread (often our
+                # own), not fresh feedback; but it still advances the cursor below.
+                new_inline = [c for c in new_inline_any if not c.get("in_reply_to_id")]
+                if not new_reviews and not new_inline_any:
                     state[str(number)] = rec
                     continue
 
-                # Advance the cursor regardless of whether any review was
-                # actionable, so an approval/comment isn't re-examined next poll.
-                rec["last_review_id"] = max(r["id"] for r in reviews)
-                actionable = [r for r in new_reviews if self._review_actionable(r)]
-                if actionable:
+                # Advance both cursors regardless of actionability, so an
+                # approval / already-seen comment isn't re-examined next poll.
+                if reviews:
+                    rec["last_review_id"] = max(r["id"] for r in reviews)
+                if inline:
+                    rec["last_comment_id"] = max(c["id"] for c in inline)
+
+                # Actionable when a new review asks for changes/has a body, OR there
+                # are new inline comments — an empty-summary review whose feedback
+                # lives entirely in line comments must still trigger a revision.
+                actionable_reviews = [
+                    r for r in new_reviews if self._review_actionable(r)
+                ]
+                if actionable_reviews or new_inline:
                     self.log.info(
-                        "#PR%s: %d new actionable review(s) -> resuming context",
+                        "#PR%s: %d review(s) + %d inline comment(s) -> resuming context",
                         number,
-                        len(actionable),
+                        len(actionable_reviews),
+                        len(new_inline),
                     )
-                    if self._address_pr_review(number, rec, actionable):
+                    if self._address_pr_review(
+                        number, rec, actionable_reviews, new_inline
+                    ):
                         acted.append(number)
                     if rec.get("_deferred"):
                         state.pop(str(number), None)
@@ -1219,18 +1249,26 @@ class Orchestrator:
             "worktree": worktree,
             "session_id": load_session(worktree) or "",
             "last_review_id": 0,
+            "last_comment_id": 0,
             "attempts": 0,
         }
 
     def _address_pr_review(
-        self, number: int, rec: dict, reviews: list[dict]
+        self,
+        number: int,
+        rec: dict,
+        reviews: list[dict],
+        inline: list[dict] | None = None,
     ) -> bool:
-        """Resume the PR's context and revise the branch to address ``reviews``.
+        """Resume the PR's context and revise the branch to address feedback.
 
-        Returns whether a revision was actually run. Mutates ``rec`` in place
-        (attempt count, ``_deferred`` flag). Bounded by ``review_iterations``:
-        once exhausted, or if a guard fails / push fails, the PR is deferred.
+        ``reviews`` are actionable review summaries; ``inline`` are new line-level
+        review-thread comments (CodeRabbit's surface). Returns whether a revision
+        was actually run. Mutates ``rec`` in place (attempt count, ``_deferred``
+        flag). Bounded by ``review_iterations``: once exhausted, or if a guard
+        fails / push fails, the PR is deferred.
         """
+        inline = inline or []
         if rec.get("attempts", 0) >= self.config.budget.review_iterations:
             self._defer_pr(
                 number,
@@ -1248,7 +1286,7 @@ class Orchestrator:
 
         worktree = rec["worktree"]
         branch = rec["branch"]
-        feedback = _pr_review_feedback(reviews)
+        feedback = _pr_review_feedback(reviews, inline)
         impl = self.implementer.run(ticket, worktree, branch, feedback=feedback)
         rec["attempts"] = rec.get("attempts", 0) + 1
         self.log.info(
@@ -1288,6 +1326,10 @@ class Orchestrator:
             )
             return True
 
+        # Reply on each addressed inline thread (CodeRabbit-style), so a human
+        # sees the loop responding where the feedback was left.
+        self._reply_to_inline(number, inline)
+
         # The implementer did the revision, so it speaks here.
         self._comment(
             ticket,
@@ -1296,6 +1338,34 @@ class Orchestrator:
             agent=IMPLEMENTER,
         )
         return True
+
+    def _reply_to_inline(self, number: int, inline: list[dict]) -> None:
+        """Reply on each addressed inline review thread describing the change.
+
+        Gated by ``config.review.reply_to_inline``. Best-effort: a failed reply is
+        logged, never fatal (the revision already landed).
+        """
+        if not inline or not self.config.review.reply_to_inline:
+            return
+        for c in inline:
+            loc = c.get("path") or "(file)"
+            if c.get("line"):
+                loc += f":{c['line']}"
+            body = (
+                f"🤖 Addressed in the latest revision (`{loc}`). If this didn't fully "
+                f"resolve it, reply and idle-loop will take another pass.\n\n{SHIPPED_BY}"
+            )
+            try:
+                self.identities.client(IMPLEMENTER).reply_to_review_comment(
+                    number, c["id"], body
+                )
+            except GitHubError as exc:
+                self.log.warning(
+                    "reply to inline comment %s on PR #%s failed: %s",
+                    c.get("id"),
+                    number,
+                    exc,
+                )
 
     def _defer_pr(self, number: int, rec: dict, reason: str) -> None:
         """Hand a watched PR back to a human: drop idle:listen, flag needs-human.
@@ -1440,8 +1510,32 @@ def _review_feedback(verdict: ReviewVerdict) -> str:
     return "\n".join(lines) if lines else "The reviewer requested changes."
 
 
-def _pr_review_feedback(reviews: list[dict]) -> str:
-    """Render one or more GitHub PR reviews as actionable implementer feedback."""
+_SUGGESTION_RE = re.compile(r"```suggestion\n(.*?)```", re.DOTALL)
+
+
+def _render_suggestion(body: str) -> str:
+    """If ``body`` carries GitHub ``suggestion`` block(s), spell them out.
+
+    Returns an explicit "apply this exact replacement" note per suggestion so the
+    implementer applies it verbatim; empty string when there is no suggestion.
+    """
+    notes = []
+    for match in _SUGGESTION_RE.finditer(body):
+        replacement = match.group(1).rstrip("\n")
+        notes.append(
+            "  ↳ GitHub suggestion — apply this exact replacement for the line(s):\n"
+            + "\n".join(f"    {ln}" for ln in replacement.splitlines())
+        )
+    return "\n".join(notes)
+
+
+def _pr_review_feedback(reviews: list[dict], inline: list[dict] | None = None) -> str:
+    """Render PR review summaries + inline thread comments as implementer feedback.
+
+    Summaries render as ``<user> (<state>): <body>``; inline comments render as
+    ``path:line: body`` so the revision is line-targeted, and any GitHub
+    ``suggestion`` block is spelled out as an exact replacement to apply.
+    """
     lines: list[str] = []
     for r in reviews:
         who = r.get("user") or "a reviewer"
@@ -1449,6 +1543,20 @@ def _pr_review_feedback(reviews: list[dict]) -> str:
         body = (r.get("body") or "").strip()
         header = f"{who} ({state}):" if state else f"{who}:"
         lines.append(f"{header} {body}" if body else header)
+
+    inline = inline or []
+    if inline:
+        lines.append("Inline comments to address:")
+        for c in inline:
+            loc = c.get("path") or "(file)"
+            if c.get("line"):
+                loc += f":{c['line']}"
+            body = (c.get("body") or "").strip()
+            lines.append(f"- {loc}: {body}")
+            suggestion = _render_suggestion(body)
+            if suggestion:
+                lines.append(suggestion)
+
     joined = "\n".join(lines).strip()
     return joined or "A reviewer requested changes on the PR."
 
