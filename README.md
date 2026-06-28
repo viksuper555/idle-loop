@@ -28,12 +28,16 @@ invoked, no tokens are burned, no Claude login required.
 - **No `ANTHROPIC_API_KEY`. No `claude` login** — those are only for *real* runs ([below](#real-runs)).
 
 ```bash
-git clone https://github.com/viksuper555/idle-loop && cd idle-loop
-pip install -e ".[dev]"                                  # Python 3.11+
-gh auth login                                            # or: export GITHUB_TOKEN=ghp_...
-REPO=you/your-demo-repo examples/seed_issues.sh          # seeds 3 demo tickets onto that repo
-sed -i.bak 's#^repo:.*#repo: "you/your-demo-repo"#' idle.config.yaml && python idle_loop.py --dry-run
+git clone https://github.com/viksuper555/idle-loop && cd idle-loop && pip install -e ".[dev]"
+gh auth login                                                  # or: export GITHUB_TOKEN=ghp_...
+export REPO="you/idle-demo"                                    # ← the ONE thing to edit: a repo name you own
+gh repo create "$REPO" --public --add-readme && examples/seed_issues.sh   # create it + seed 3 demo tickets
+sed -i.bak "s#^repo:.*#repo: \"$REPO\"#" idle.config.yaml && python idle_loop.py --dry-run
 ```
+
+`examples/seed_issues.sh` reads `$REPO` and opens exactly the three `idle:ready` tickets below;
+the `sed` points `idle.config.yaml`'s `repo:` at that same `$REPO` — so the placeholder is set
+**once** and nothing else needs editing.
 
 **Expected output** — one priced line per ready ticket (numbers are illustrative; the two small
 tickets land cheap, the big vague one prices high so triage would park it for a human):
@@ -51,9 +55,10 @@ zero-token heuristic estimator; it never calls an agent. A **real** run (next se
 **Claude usage window** (via the `claude` CLI) to actually implement tickets — there is still no
 per-token API bill, but it consumes your plan's usage.
 
-**Remaining friction (be honest):** the dry run reads tickets from GitHub, so you do need a repo
-with `idle:ready` issues — hence the one-time `gh repo`/seed step and pointing `repo:` at it. There
-is no fully-offline demo. Everything else is copy-paste.
+**Remaining friction (be honest):** the dry run reads tickets from GitHub, so the demo needs the
+[`gh`](https://cli.github.com) CLI authenticated and one network round-trip to create + seed the
+repo (steps 2–4 above). There is no fully-offline demo — but every step is in the block; the only
+thing you edit is the `REPO` value on line 3.
 
 **Next steps:** [real runs with `--max-tickets`](#real-runs) · [unattended (listener / `idle_loopd`)](#unattended--the-listener--cron-survives-rate-limits) · [per-agent identities](#per-agent-github-identities) · [full config reference](#config-reference-idleconfigyaml).
 
