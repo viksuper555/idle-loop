@@ -23,24 +23,26 @@ invoked, no tokens are burned, no Claude login required.
 
 **Prereqs (that's all):**
 - **Python 3.11+**
-- the [`gh`](https://cli.github.com) CLI logged in — or a **`GITHUB_TOKEN`** in the environment
-- a GitHub repo you can open issues on (any throwaway you own works)
+- the [`gh`](https://cli.github.com) CLI **authenticated** (`gh auth login`) — the demo uses it to
+  create + seed the demo repo, and idle-loop reads your token from it. (A bare `GITHUB_TOKEN` lets
+  idle-loop *read* issues, but the `gh repo create`/seed steps below need `gh` itself.)
 - **No `ANTHROPIC_API_KEY`. No `claude` login** — those are only for *real* runs ([below](#real-runs)).
 
 ```bash
 git clone https://github.com/viksuper555/idle-loop && cd idle-loop && pip install -e ".[dev]"
-gh auth login                                                  # or: export GITHUB_TOKEN=ghp_...
+gh auth login                                                  # authenticates gh + provides the token
 export REPO="you/idle-demo"                                    # ← the ONE thing to edit: a repo name you own
-gh repo create "$REPO" --public --add-readme && examples/seed_issues.sh   # create it + seed 3 demo tickets
+gh repo create "$REPO" --public --add-readme && bash examples/seed_issues.sh   # create it + seed 3 demo tickets
 sed -i.bak "s#^repo:.*#repo: \"$REPO\"#" idle.config.yaml && python idle_loop.py --dry-run
 ```
 
-`examples/seed_issues.sh` reads `$REPO` and opens exactly the three `idle:ready` tickets below;
-the `sed` points `idle.config.yaml`'s `repo:` at that same `$REPO` — so the placeholder is set
-**once** and nothing else needs editing.
+`bash examples/seed_issues.sh` reads `$REPO` and opens exactly the three `idle:ready` tickets below
+(each with an `## Acceptance Criteria` checklist); the `sed` points `idle.config.yaml`'s `repo:` at
+that same `$REPO` — so the placeholder is set **once** and nothing else needs editing.
 
-**Expected output** — one priced line per ready ticket (numbers are illustrative; the two small
-tickets land cheap, the big vague one prices high so triage would park it for a human):
+**Expected output** — `--dry-run` prints one line per ready ticket as `#<n>  <title>  ~$X ± $Y`
+(numbers are illustrative; the two small tickets land cheap, the big vague one prices high so triage
+would park it for a human):
 
 ```
 #1  Add a multiply function to calc            ~$3 ± $1
