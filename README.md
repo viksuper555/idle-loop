@@ -15,18 +15,14 @@ by ROI: ship the \$30 ticket tonight, flag the \$300 ticket for a human first.
 
 ---
 
-## Quickstart — a working run in 5 minutes (zero spend)
+## Quickstart
 
 The fastest way to *see* idle-loop work is its signature feature: the cost estimator. A
 **dry run prices every ready ticket and prints a cost band, spending nothing** — no agent is
 invoked, no tokens are burned, no Claude login required.
 
-**Prereqs (that's all):**
-- **Python 3.11+**
-- the [`gh`](https://cli.github.com) CLI **authenticated** (`gh auth login`) — the demo uses it to
-  create + seed the demo repo, and idle-loop reads your token from it. (A bare `GITHUB_TOKEN` lets
-  idle-loop *read* issues, but the `gh repo create`/seed steps below need `gh` itself.)
-- **No `ANTHROPIC_API_KEY`. No `claude` login** — those are only for *real* runs ([below](#real-runs)).
+**Prereqs:** Python 3.11+ and the [`gh`](https://cli.github.com) CLI authenticated (`gh auth login`) —
+used to create + seed the demo repo, and idle-loop reads your token from it.
 
 ```bash
 git clone https://github.com/viksuper555/idle-loop && cd idle-loop && pip install -e ".[dev]"
@@ -57,7 +53,7 @@ zero-token heuristic estimator; it never calls an agent. A **real** run (next se
 **Claude usage window** (via the `claude` CLI) to actually implement tickets — there is still no
 per-token API bill, but it consumes your plan's usage.
 
-**Remaining friction (be honest):** the dry run reads tickets from GitHub, so the demo needs the
+**Remaining friction:** the dry run reads tickets from GitHub, so the demo needs the
 [`gh`](https://cli.github.com) CLI authenticated and one network round-trip to create + seed the
 repo (steps 2–4 above). There is no fully-offline demo — but every step is in the block; the only
 thing you edit is the `REPO` value on line 3.
