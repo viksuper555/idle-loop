@@ -15,6 +15,50 @@ by ROI: ship the \$30 ticket tonight, flag the \$300 ticket for a human first.
 
 ---
 
+## Quickstart — a working run in 5 minutes (zero spend)
+
+The fastest way to *see* idle-loop work is its signature feature: the cost estimator. A
+**dry run prices every ready ticket and prints a cost band, spending nothing** — no agent is
+invoked, no tokens are burned, no Claude login required.
+
+**Prereqs (that's all):**
+- **Python 3.11+**
+- the [`gh`](https://cli.github.com) CLI logged in — or a **`GITHUB_TOKEN`** in the environment
+- a GitHub repo you can open issues on (any throwaway you own works)
+- **No `ANTHROPIC_API_KEY`. No `claude` login** — those are only for *real* runs ([below](#real-runs)).
+
+```bash
+git clone https://github.com/viksuper555/idle-loop && cd idle-loop
+pip install -e ".[dev]"                                  # Python 3.11+
+gh auth login                                            # or: export GITHUB_TOKEN=ghp_...
+REPO=you/your-demo-repo examples/seed_issues.sh          # seeds 3 demo tickets onto that repo
+sed -i.bak 's#^repo:.*#repo: "you/your-demo-repo"#' idle.config.yaml && python idle_loop.py --dry-run
+```
+
+**Expected output** — one priced line per ready ticket (numbers are illustrative; the two small
+tickets land cheap, the big vague one prices high so triage would park it for a human):
+
+```
+#1  Add a multiply function to calc            ~$3 ± $1
+#2  Add a mean helper with input validation    ~$4 ± $2
+#3  Add a full statistics package + CLI        ~$22 ± $11
+```
+
+If you see cost bands, it works — that's the differentiator running end to end.
+
+**What costs what.** `--dry-run` is **free**: it reads issues from GitHub and prices them with the
+zero-token heuristic estimator; it never calls an agent. A **real** run (next section) spends your
+**Claude usage window** (via the `claude` CLI) to actually implement tickets — there is still no
+per-token API bill, but it consumes your plan's usage.
+
+**Remaining friction (be honest):** the dry run reads tickets from GitHub, so you do need a repo
+with `idle:ready` issues — hence the one-time `gh repo`/seed step and pointing `repo:` at it. There
+is no fully-offline demo. Everything else is copy-paste.
+
+**Next steps:** [real runs with `--max-tickets`](#real-runs) · [unattended (listener / `idle_loopd`)](#unattended--the-listener--cron-survives-rate-limits) · [per-agent identities](#per-agent-github-identities) · [full config reference](#config-reference-idleconfigyaml).
+
+---
+
 ## Why
 
 Naive autonomous loops ("loopmaxxing") burn budget because they run without verifiable exit
@@ -55,25 +99,18 @@ approval (and a human, if configured).
 
 ---
 
-## Quickstart
+## Real runs
+
+Once the [Quickstart](#quickstart--a-working-run-in-5-minutes-zero-spend) dry run prints cost
+bands, a **real** run lets idle-loop actually implement the affordable tickets and park the rest.
+This is where it spends your **Claude usage window** (via the `claude` CLI), so it needs a Claude
+login — but still **no `ANTHROPIC_API_KEY`**.
 
 ```bash
-# 1. Install (Python 3.11+)
-pip install -e ".[dev]"
+# 1. Log in to Claude once (the harness drives the `claude` CLI; no API key).
+claude            # then /login — verify with `claude --version`
 
-# 2. Configure your target repo + thresholds
-$EDITOR idle.config.yaml          # set repo: "owner/name"
-
-# 3. Auth — NO API key. The agents run through the Claude Code harness, so just
-#    log in once:  claude  (then /login)   — verify with `claude --version`.
-#    The GitHub client uses GITHUB_TOKEN / GH_TOKEN (or `gh auth token`).
-export GITHUB_TOKEN=ghp_...        # or: gh auth login
-
-# 4. Dry run — list ready issues with a cost estimate each, taking NO action
-#    (estimator + GitHub only; never invokes the harness)
-python idle_loop.py --dry-run
-
-# 5. Real run — process affordable tickets (parks the rest)
+# 2. Work the affordable tickets, parking anything over the cost threshold.
 python idle_loop.py --max-tickets 3
 
 # …or run it unattended, surviving rate limits (see "Unattended" below):
@@ -82,7 +119,7 @@ python idle_loop.py --max-tickets 3
 
 A ticket is **ready** when it carries the `idle:ready` label **and** has an
 `## Acceptance Criteria` checklist — tickets without acceptance criteria are rejected, never
-guessed at.
+guessed at. See [`examples/`](examples/) for the bundled demo target repo and seed tickets.
 
 ### How the agents run — the Claude Code harness (no API key)
 
