@@ -491,6 +491,51 @@ def test_get_pull_request_parses_head_branch(monkeypatch):
     assert session.calls[0]["url"] == "https://api.github.com/repos/owner/name/pulls/7"
 
 
+def test_list_review_comments_normalizes_fields(monkeypatch):
+    client, session = make_client(
+        monkeypatch,
+        [
+            FakeResponse(
+                200,
+                [
+                    {
+                        "id": 200,
+                        "path": "src/x.py",
+                        "line": 7,
+                        "body": "rename this",
+                        "user": {"login": "alice"},
+                    },
+                    # line falls back to original_line; in_reply_to_id preserved.
+                    {"id": 201, "path": "a.py", "original_line": 3, "body": "", "in_reply_to_id": 200},
+                ],
+            )
+        ],
+    )
+    out = client.list_review_comments(7)
+    assert out[0] == {
+        "id": 200,
+        "path": "src/x.py",
+        "line": 7,
+        "body": "rename this",
+        "user": "alice",
+        "in_reply_to_id": None,
+    }
+    assert out[1]["line"] == 3 and out[1]["in_reply_to_id"] == 200 and out[1]["user"] == ""
+    call = session.calls[0]
+    assert call["url"] == "https://api.github.com/repos/owner/name/pulls/7/comments"
+    assert call["params"] == {"per_page": 100}
+
+
+def test_reply_to_review_comment_posts_to_replies(monkeypatch):
+    client, session = make_client(monkeypatch, [FakeResponse(201, {"id": 999})])
+    out = client.reply_to_review_comment(7, 200, "addressed")
+    assert out == {"id": 999}
+    call = session.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"] == "https://api.github.com/repos/owner/name/pulls/7/comments/200/replies"
+    assert call["json"] == {"body": "addressed"}
+
+
 def test_list_reviews_normalizes_fields(monkeypatch):
     client, session = make_client(
         monkeypatch,

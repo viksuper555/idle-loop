@@ -47,6 +47,8 @@ class FakeGitHub:
         # PR-review watching fixtures.
         self.labelled_prs: dict[str, list[dict]] = {}  # label -> [{number, title}]
         self.reviews: dict[int, list[dict]] = {}  # pr number -> [review dicts]
+        self.review_comments: dict[int, list[dict]] = {}  # pr number -> [inline comment dicts]
+        self.replies: list[tuple[int, int, str]] = []  # (pr, comment_id, body)
         self.pr_details: dict[int, dict] = {}  # pr number -> get_pull_request payload
         # Open PRs keyed by head branch, for find_open_pr_by_head (the reuse path).
         self.open_pr_by_head: dict[str, dict] = {}
@@ -69,6 +71,13 @@ class FakeGitHub:
 
     def list_reviews(self, number: int) -> list[dict]:
         return list(self.reviews.get(number, []))
+
+    def list_review_comments(self, number: int) -> list[dict]:
+        return list(self.review_comments.get(number, []))
+
+    def reply_to_review_comment(self, number: int, comment_id: int, body: str) -> dict:
+        self.replies.append((number, comment_id, body))
+        return {"id": 9_000 + comment_id}
 
     def get_pull_request(self, number: int) -> dict:
         return self.pr_details.get(
@@ -912,8 +921,19 @@ def test_open_pr_marks_listen_and_records_watch_state(tmp_path):
     assert saved["last_review_id"] == 0  # no reviews yet
 
 
+def _inline(id_, body, path="src/x.py", line=10, user="alice", in_reply_to_id=None):
+    return {
+        "id": id_,
+        "path": path,
+        "line": line,
+        "body": body,
+        "user": user,
+        "in_reply_to_id": in_reply_to_id,
+    }
+
+
 def _seed_watch(orch, pr_number, *, issue=1, branch="idle/issue-1", worktree=None,
-                last_review_id=0, attempts=0):
+                last_review_id=0, last_comment_id=0, attempts=0):
     state = orch._load_pr_watch()
     state[str(pr_number)] = {
         "issue": issue,
@@ -921,6 +941,7 @@ def _seed_watch(orch, pr_number, *, issue=1, branch="idle/issue-1", worktree=Non
         "worktree": worktree or orch.repo_dir,
         "session_id": "sess",
         "last_review_id": last_review_id,
+        "last_comment_id": last_comment_id,
         "attempts": attempts,
     }
     orch._save_pr_watch(state)
@@ -1035,6 +1056,100 @@ def test_watch_reviews_skips_non_idle_branch(tmp_path):
     acted = orch.watch_reviews()
 
     assert acted == [] and implementer.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# Inline PR review comments — CodeRabbit-style (#46)
+# --------------------------------------------------------------------------- #
+def test_inline_only_review_with_empty_body_is_actionable(tmp_path):
+    # A COMMENTED review with an EMPTY body but inline comments must still act.
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = [_review(100, "COMMENTED", body="")]  # empty summary
+    gh.review_comments[5] = [
+        _inline(200, "keep the quickstart brief", path="README.md", line=42)
+    ]
+    _seed_watch(orch, 5, last_review_id=0, last_comment_id=0)
+
+    acted = orch.watch_reviews()
+
+    assert acted == [5]  # acted despite the empty review body
+    assert implementer.calls == [(1, str(tmp_path), "idle/issue-1")]
+    fb = implementer.feedbacks[-1]
+    assert fb and "README.md:42: keep the quickstart brief" in fb  # path:line: body
+    # Cursors advanced so the same comment won't re-trigger next poll.
+    state = orch._load_pr_watch()
+    assert state["5"]["last_comment_id"] == 200
+
+
+def test_inline_comment_gets_a_reply_on_its_thread(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = [_review(100, "COMMENTED", body="")]
+    gh.review_comments[5] = [_inline(200, "rename this", path="src/x.py", line=7)]
+    _seed_watch(orch, 5)
+
+    orch.watch_reviews()
+
+    # A reply was posted on the addressed inline thread (comment id 200).
+    assert any(pr == 5 and cid == 200 for pr, cid, _ in gh.replies)
+
+
+def test_inline_suggestion_block_is_spelled_out_in_feedback(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = [_review(100, "COMMENTED", body="")]
+    gh.review_comments[5] = [
+        _inline(200, "use a constant:\n```suggestion\nMAX = 10\n```", path="src/x.py", line=3)
+    ]
+    _seed_watch(orch, 5)
+
+    orch.watch_reviews()
+
+    fb = implementer.feedbacks[-1]
+    assert "GitHub suggestion" in fb and "MAX = 10" in fb  # recognized + applied
+
+
+def test_already_addressed_inline_comments_are_skipped(tmp_path):
+    # An inline comment at/under the cursor is not re-handled.
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = []
+    gh.review_comments[5] = [_inline(200, "old, already handled")]
+    _seed_watch(orch, 5, last_comment_id=200)  # cursor already past it
+
+    acted = orch.watch_reviews()
+
+    assert acted == [] and implementer.calls == [] and gh.replies == []
+
+
+def test_inline_reply_is_replies_to_only_top_level_comments(tmp_path):
+    # A reply (in_reply_to_id set) is part of an existing thread, not fresh feedback.
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = []
+    gh.review_comments[5] = [_inline(201, "a reply in a thread", in_reply_to_id=200)]
+    _seed_watch(orch, 5, last_comment_id=0)
+
+    acted = orch.watch_reviews()
+
+    assert acted == [] and implementer.calls == []  # replies aren't actionable
+    # But the cursor still advances so it isn't re-examined.
+    assert orch._load_pr_watch()["5"]["last_comment_id"] == 201
+
+
+def test_reply_to_inline_disabled_by_config(tmp_path):
+    orch, gh, implementer, reviewer = make_orch(tmp_path, issues=[ticket(1)])
+    orch.config.review.reply_to_inline = False
+    gh.labelled_prs["idle:listen"] = [{"number": 5, "title": "x"}]
+    gh.reviews[5] = [_review(100, "COMMENTED", body="")]
+    gh.review_comments[5] = [_inline(200, "fix this")]
+    _seed_watch(orch, 5)
+
+    acted = orch.watch_reviews()
+
+    assert acted == [5]  # still revises ...
+    assert gh.replies == []  # ... but posts no inline reply when gated off
 
 
 def test_main_watch_reviews_flag_calls_watch(tmp_path, monkeypatch):

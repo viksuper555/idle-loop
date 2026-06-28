@@ -301,6 +301,50 @@ class GitHubClient:
             )
         return reviews
 
+    def list_review_comments(self, number: int) -> list[dict]:
+        """List inline (line-level) review comments on PR ``number``, oldest first.
+
+        These are the ``pulls/{N}/comments`` thread comments — where CodeRabbit /
+        a human's line-level feedback and GitHub ``suggestion`` blocks live, as
+        opposed to the per-review summary bodies from :meth:`list_reviews`.
+
+        Each entry is ``{"id", "path", "line", "body", "user", "in_reply_to_id"}``
+        where ``line`` falls back to the comment's ``original_line`` (a comment on
+        an outdated diff position), and ``in_reply_to_id`` is set on replies (so a
+        reply in a thread can be told apart from a fresh top-level comment).
+        """
+        resp = self._request(
+            "GET",
+            f"/repos/{self.repo}/pulls/{number}/comments",
+            params={"per_page": 100},
+        )
+        comments = []
+        for c in resp.json():
+            comments.append(
+                {
+                    "id": int(c["id"]),
+                    "path": c.get("path", ""),
+                    "line": c.get("line") or c.get("original_line"),
+                    "body": c.get("body") or "",
+                    "user": (c.get("user") or {}).get("login", ""),
+                    "in_reply_to_id": c.get("in_reply_to_id"),
+                }
+            )
+        return comments
+
+    def reply_to_review_comment(self, number: int, comment_id: int, body: str) -> dict:
+        """Reply to inline review comment ``comment_id`` on PR ``number``.
+
+        Posts to ``pulls/{N}/comments/{id}/replies`` so the reply threads under
+        the original line comment (CodeRabbit-style). Returns ``{"id"}``.
+        """
+        resp = self._request(
+            "POST",
+            f"/repos/{self.repo}/pulls/{number}/comments/{comment_id}/replies",
+            json={"body": body},
+        )
+        return {"id": int(resp.json()["id"])}
+
     def pr_status_for_branch(self, branch: str) -> str:
         """Classify the PR lifecycle for head ``branch``.
 
